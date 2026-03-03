@@ -4,7 +4,7 @@
 
 將線上會議或教育訓練中的英文語音，即時轉錄並翻譯成繁體中文字幕顯示於終端機。亦可離線處理音訊檔案。
 
-適用平台：macOS（Apple Silicon / Intel）
+適用平台：macOS（Apple Silicon）
 
 ---
 

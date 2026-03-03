@@ -55,7 +55,7 @@ Author: Jason Cheng ([Jason Tools](https://jasoncheng.com.tw))
 
 ## 系統需求
 
-- macOS（Apple Silicon / Intel）
+- macOS（Apple Silicon）
 - Python 3.12+
 - Homebrew
 - [BlackHole 2ch](https://existential.audio/blackhole/)（虛擬音訊驅動，安裝腳本會自動安裝）
