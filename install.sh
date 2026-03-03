@@ -1,16 +1,51 @@
 #!/bin/bash
 # 即時英翻中字幕系統 - 安裝腳本
 # 檢查並安裝所有必要的依賴項目
+# 支援一鍵安裝：curl -fsSL https://raw.githubusercontent.com/jasoncheng7115/jt-live-whisper/main/install.sh | bash
 # Author: Jason Cheng (Jason Tools)
 
 set -e
 
-SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+GITHUB_REPO="https://github.com/jasoncheng7115/jt-live-whisper.git"
+GITHUB_RAW="https://raw.githubusercontent.com/jasoncheng7115/jt-live-whisper/main"
+
+# ─── Bootstrap：透過 curl | bash 執行時，自動 clone 並安裝 ───
+SCRIPT_DIR="$(cd "$(dirname "$0")" 2>/dev/null && pwd)"
+if [ ! -f "$SCRIPT_DIR/translate_meeting.py" ]; then
+    echo ""
+    echo -e "\033[38;2;100;180;255m============================================================\033[0m"
+    echo -e "\033[38;2;100;180;255m\033[1m  jt-live-whisper - 一鍵安裝\033[0m"
+    echo -e "\033[38;2;100;180;255m============================================================\033[0m"
+    echo ""
+
+    # 檢查 git
+    if ! command -v git &>/dev/null; then
+        echo -e "\033[38;2;255;220;80m[提醒] 需要 git，正在觸發 Xcode Command Line Tools 安裝...\033[0m"
+        xcode-select --install 2>/dev/null || true
+        echo -e "\033[38;2;255;255;255m安裝完成後請重新執行此指令。\033[0m"
+        exit 1
+    fi
+
+    INSTALL_DIR="./jt-live-whisper"
+    if [ -d "$INSTALL_DIR" ]; then
+        echo -e "\033[38;2;255;255;255m目錄已存在: $INSTALL_DIR\033[0m"
+        echo -e "\033[38;2;255;255;255m進入目錄執行安裝...\033[0m"
+        cd "$INSTALL_DIR"
+    else
+        echo -e "\033[38;2;255;255;255m正在從 GitHub 下載 jt-live-whisper...\033[0m"
+        git clone "$GITHUB_REPO" "$INSTALL_DIR"
+        cd "$INSTALL_DIR"
+    fi
+
+    chmod +x install.sh start.sh
+    exec ./install.sh "$@"
+fi
+# ─── Bootstrap 結束 ──────────────────────────────────────
+
 VENV_DIR="$SCRIPT_DIR/venv"
 WHISPER_DIR="$SCRIPT_DIR/whisper.cpp"
 MODELS_DIR="$WHISPER_DIR/models"
 ARGOS_PKG_DIR="$HOME/.local/share/argos-translate/packages/translate-en_zh-1_9"
-GITHUB_REPO="https://github.com/jasoncheng7115/jt-live-whisper.git"
 
 # 偵測 ARM Homebrew Python（Moonshine 需要 ARM64 原生 Python）
 if [ -x "/opt/homebrew/bin/python3.12" ]; then

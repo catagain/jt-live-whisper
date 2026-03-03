@@ -59,25 +59,26 @@ Author: Jason Cheng ([Jason Tools](https://jasoncheng.com.tw))
 - Python 3.12+
 - Homebrew
 - [BlackHole 2ch](https://existential.audio/blackhole/)（虛擬音訊驅動，安裝腳本會自動安裝）
-- 本地端 LLM 伺服器（推薦 [Ollama](https://ollama.com/)，翻譯/摘要用，可選配 Argos 離線替代）
+- 本地端 LLM 伺服器（推薦 [Ollama](https://ollama.com/)，翻譯/摘要用，可選配 Argos 離線替代。推薦搭配 [NVIDIA DGX Spark](https://www.nvidia.com/zh-tw/products/workstations/dgx-spark/) 運行 Ollama，CP 值高）
 
 ## 快速開始
 
-### 1. 取得程式碼
+### 1. 一鍵安裝
+
+打開終端機，貼上這一行即可自動下載並安裝所有元件：
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/jasoncheng7115/jt-live-whisper/main/install.sh | bash
+```
+
+或使用 git clone：
 
 ```bash
 git clone https://github.com/jasoncheng7115/jt-live-whisper.git
-cd jt-live-whisper
+cd jt-live-whisper && ./install.sh
 ```
 
-### 2. 執行安裝
-
-```bash
-chmod +x install.sh start.sh
-./install.sh
-```
-
-安裝腳本會自動下載並設定所有本地端 AI 模型和相依套件（Whisper 語音辨識模型、Moonshine 串流辨識模型、Argos 離線翻譯模型、whisper.cpp 編譯等）。
+安裝腳本會自動下載並設定所有地端 AI 模型和相依套件（Whisper 語音辨識模型、Moonshine 串流辨識模型、Argos 離線翻譯模型、whisper.cpp 編譯等）。
 
 > 首次安裝預估時間：約 10~20 分鐘（視網路速度而定，主要是下載 AI 模型和編譯 whisper.cpp）
 
@@ -220,12 +221,16 @@ jt-live-whisper/
 
 自動從 GitHub 下載最新版本的程式檔案，升級後建議重新執行 `./install.sh` 確認相依套件完整。
 
-## 詳細文件
+---
 
-完整安裝與使用說明請參考 [SOP.md](SOP.md)。
+## >>> [完整使用手冊（SOP.md）](SOP.md) <<<
+
+包含完整安裝教學、macOS 音訊設定圖解、所有功能模式詳細說明、互動式選單操作、說話者辨識設定、摘要功能用法、進階 CLI 參數、FAQ 等。
+
+---
 
 ## License
 
 本專案採用 [Apache License 2.0](LICENSE) 授權。
 
-Copyright 2024-2026 Jason Cheng (Jason Tools)
+Copyright 2026 Jason Cheng (Jason Tools)
