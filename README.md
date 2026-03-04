@@ -1,6 +1,4 @@
-# jt-live-whisper
-
-**v1.7.6**
+# jt-live-whisper v1.7.6
 
 **100% 全地端 AI 語音工具集**：即時轉錄、即時翻譯、錄音檔批次處理、講者辨識、會議摘要，所有 AI 模型皆在自有設備上運行，資料不經過任何雲端服務。
 
@@ -36,7 +34,7 @@ Author: Jason Cheng ([Jason Tools](https://jasoncheng.com.tw))
 
 ## 五大核心功能
 
-### 1. 即時語音轉錄翻譯（最強功能）
+### 1. 即時語音轉錄翻譯（主要功能）
 擷取 macOS 系統音訊，本地端 AI 即時辨識語音並翻譯成繁體中文字幕顯示於終端機。開會、看影片、聽 Podcast 即時翻譯。
 
 ![即時英翻中字幕畫面](images/realtime-en2zh-2.png)
