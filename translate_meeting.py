@@ -32,8 +32,9 @@ import ctranslate2
 import opencc
 import sentencepiece
 
-# 簡體→台灣繁體轉換器（Argos 離線翻譯輸出為簡體，需轉換；LLM 偶爾輸出簡體也適用）
-S2TWP = opencc.OpenCC("s2twp")
+# 簡體→台灣繁體轉換器（僅字元層級轉換，不做詞組匹配避免誤轉如「裡面包含」→「裡麵包含」）
+# 詞組層級的轉換（如 面包→麵包）交由 LLM 在翻譯時直接輸出正確繁體
+S2TWP = opencc.OpenCC("s2tw")
 
 # Moonshine ASR（選用，未安裝時自動降級為 Whisper only）
 _MOONSHINE_AVAILABLE = False
@@ -3272,7 +3273,7 @@ def process_audio_file(input_path, mode, translator, model_size="large-v3-turbo"
 
 
 def summarize_log_file(input_path, model, host, port, server_type="ollama"):
-    """讀取記錄檔 → 建 prompt → 呼叫 LLM → S2TWP 轉換 → 寫摘要檔
+    """讀取記錄檔 → 建 prompt → 呼叫 LLM → 簡繁轉換 → 寫摘要檔
     回傳 (output_path, summary_text, html_path)"""
     with open(input_path, "r", encoding="utf-8") as f:
         transcript = f.read().strip()
