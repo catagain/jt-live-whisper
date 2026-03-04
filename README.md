@@ -1,8 +1,10 @@
 # jt-live-whisper
 
-**100% 全地端 AI 語音工具集**：即時轉錄、即時翻譯、錄音檔批次處理、說話者辨識、會議摘要，所有 AI 模型皆在自有設備上運行，資料不經過任何雲端服務。
+**v1.7.6**
 
-核心功能涵蓋即時語音轉錄、英中/中英即時翻譯字幕、離線音訊檔批次處理、AI 說話者辨識（Speaker Diarization）、以及 LLM 會議摘要產出。採用 macOS 系統音訊裝置層級擷取，**理論上任何軟體的聲音輸出都能即時處理**：視訊會議（Zoom、Teams、Meet）、YouTube、Podcast、串流影片等，不限定特定應用程式。所有 AI 推論皆由地端模型完成，全程不經過第三方雲端 API。
+**100% 全地端 AI 語音工具集**：即時轉錄、即時翻譯、錄音檔批次處理、講者辨識、會議摘要，所有 AI 模型皆在自有設備上運行，資料不經過任何雲端服務。
+
+核心功能涵蓋即時語音轉錄、英中/中英即時翻譯字幕、離線音訊檔批次處理、AI 講者辨識（Speaker Diarization）、以及 LLM 會議摘要產出。採用 macOS 系統音訊裝置層級擷取，**理論上任何軟體的聲音輸出都能即時處理**：視訊會議（Zoom、Teams、Meet）、YouTube、Podcast、串流影片等，不限定特定應用程式。所有 AI 推論皆由地端模型完成，全程不經過第三方雲端 API。
 
 Author: Jason Cheng ([Jason Tools](https://jasoncheng.com.tw))
 
@@ -12,11 +14,11 @@ Author: Jason Cheng ([Jason Tools](https://jasoncheng.com.tw))
 
 某次參加原廠的線上技術課程，全程英文授課，聽得七零八落。為了補足自己英文聽力的不足，乾脆動手打造了這套工具來即時翻譯，結果功能越做越多，就變成現在這個樣子了 XD
 
-- **完全地端運行**：語音辨識、翻譯、說話者辨識、摘要全部使用自有設備上的 AI 模型，無需雲端 API Key、不上傳任何資料至第三方
+- **完全地端運行**：語音辨識、翻譯、講者辨識、摘要全部使用自有設備上的 AI 模型，無需雲端 API Key、不上傳任何資料至第三方
 - **隱私安全**：會議內容、語音資料全程留在自有設備，適合企業內部會議、機密討論
 - **零成本**：不需要付費的雲端 API（OpenAI、Google 等），所有 AI 模型皆為自由開源
 - **不限應用程式**：採用系統音訊裝置層級擷取，理論上任何軟體的聲音輸出都能處理（Zoom、Teams、Meet、YouTube、Podcast 等）
-- **功能完整**：從即時轉錄翻譯、離線音訊處理、說話者辨識到 AI 摘要，一套搞定
+- **功能完整**：從即時轉錄翻譯、離線音訊處理、講者辨識到 AI 摘要，一套搞定
 - **一鍵安裝**：安裝腳本自動下載並編譯所有 AI 模型和相依套件
 
 ## 使用的 AI 模型
@@ -28,7 +30,7 @@ Author: Jason Cheng ([Jason Tools](https://jasoncheng.com.tw))
 | 語音辨識 (離線) | **faster-whisper** (CTranslate2) | 離線音訊檔處理，支援 VAD 靜音過濾 |
 | 翻譯 / 摘要 | **Qwen 2.5** / **Phi-4** 等 LLM | 透過地端 Ollama 或其他 LLM 伺服器運行（本機或區域網路） |
 | 翻譯 (離線備援) | **Argos Translate** | 完全離線的輕量翻譯模型，不需 LLM 伺服器 |
-| 說話者辨識 | **resemblyzer** + **spectralcluster** | 聲紋特徵提取 + Google 頻譜分群演算法 |
+| 講者辨識 | **resemblyzer** + **spectralcluster** | 聲紋特徵提取 + Google 頻譜分群演算法 |
 
 所有模型皆在自有設備上推論（本機或區域網路內的 GPU 伺服器），**不需要任何第三方雲端 API**。
 
@@ -44,15 +46,15 @@ Author: Jason Cheng ([Jason Tools](https://jasoncheng.com.tw))
 
 ![離線處理選單：模式與模型選擇](images/offline-menu-1.png)
 
-![離線處理選單：LLM 伺服器與說話者辨識](images/offline-menu-2.png)
+![離線處理選單：LLM 伺服器與講者辨識](images/offline-menu-2.png)
 
-### 3. AI 說話者辨識（Speaker Diarization）
+### 3. AI 講者辨識（Speaker Diarization）
 自動辨識音訊中的不同講者，以不同顏色標示，支援自動偵測或手動指定講者人數。
 
-![說話者辨識：不同講者以不同顏色顯示](images/offline-diarize-result.png)
+![講者辨識：不同講者以不同顏色顯示](images/offline-diarize-result.png)
 
 ### 4. AI 會議摘要
-即時按 Ctrl+S 或批次對記錄檔生成摘要，透過本地端 LLM 產出重點整理 + 校正逐字稿。搭配說話者辨識，摘要中不同講者以不同顏色區分。
+即時按 Ctrl+S 或批次對記錄檔生成摘要，透過本地端 LLM 產出重點整理 + 校正逐字稿。搭配講者辨識，摘要中不同講者以不同顏色區分。
 
 ![AI 會議摘要產出畫面](images/summary-output.png)
 
@@ -128,7 +130,9 @@ cd jt-live-whisper && ./install.sh
 
 ![聚集裝置設定](images/aggregate-device.png)
 
-錄音時在裝置選單選聚集裝置，即可同時錄下雙方聲音。不需要錄音的話可以跳過這步。
+程式會自動偵測聚集裝置作為錄音裝置，不需要手動選擇。不需要錄音的話可以跳過這步。
+
+> **注意：** 即時辨識僅處理系統音訊（對方/應用程式的聲音），無法即時辨識你自己的聲音。如需轉錄自己的聲音，請啟用錄製功能，事後再用 `--input` 離線產出逐字稿與摘要。
 
 ### 4. 安裝地端 LLM（翻譯/摘要用）
 
@@ -152,7 +156,7 @@ ollama pull qwen2.5:14b
 ./start.sh
 ```
 
-程式會進入互動式選單，依序選擇功能模式、AI 辨識模型、翻譯引擎等設定。
+程式會進入互動式選單，依序選擇功能模式、翻譯引擎、AI 辨識模型等設定。音訊裝置全自動偵測，不需手動選擇。
 
 ![互動式選單](images/interactive-menu.png)
 
@@ -174,7 +178,7 @@ ollama pull qwen2.5:14b
 # 英翻中 + 自動摘要
 ./start.sh --input meeting.mp3 --summarize
 
-# AI 說話者辨識
+# AI 講者辨識
 ./start.sh --input meeting.mp3 --diarize
 
 # 指定講者人數 + 摘要
@@ -206,7 +210,7 @@ ollama pull qwen2.5:14b
 | `--ollama-host HOST` | LLM 伺服器位址 | 192.168.1.40:11434 |
 | `--summary-model MODEL` | 摘要用 LLM 模型 | qwen2.5:14b |
 | `--input FILE` | 離線處理音訊檔 | |
-| `--diarize` | 啟用 AI 說話者辨識 | |
+| `--diarize` | 啟用 AI 講者辨識 | |
 | `--num-speakers N` | 指定講者人數 | 自動偵測 |
 | `--summarize [FILE ...]` | 生成 AI 摘要 | |
 
@@ -250,7 +254,7 @@ jt-live-whisper/
   音訊檔（mp3/wav/m4a/flac）
     → ffmpeg 轉檔
       → 本地端 faster-whisper AI 語音辨識
-        → （選配）AI 說話者辨識
+        → （選配）AI 講者辨識
           → 本地端 LLM 翻譯 + AI 摘要
 ```
 
@@ -266,7 +270,7 @@ jt-live-whisper/
 
 ## >>> [完整使用手冊（SOP.md）](SOP.md) <<<
 
-包含完整安裝教學、macOS 音訊設定圖解、所有功能模式詳細說明、互動式選單操作、說話者辨識設定、摘要功能用法、進階 CLI 參數、FAQ 等。
+包含完整安裝教學、macOS 音訊設定圖解、所有功能模式詳細說明、互動式選單操作、講者辨識設定、摘要功能用法、進階 CLI 參數、FAQ 等。
 
 ---
 

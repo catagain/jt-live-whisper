@@ -101,7 +101,7 @@ def _print_with_badge(text, badge_color, elapsed):
         print(f"{text}  {badge_color}{badge_str}{RESET}", flush=True)
 
 
-# 說話者辨識色彩（8 色循環，24-bit 真彩色）
+# 講者辨識色彩（8 色循環，24-bit 真彩色）
 SPEAKER_COLORS = [
     "\x1b[38;2;255;165;80m",   # 橘色
     "\x1b[38;2;100;200;255m",  # 天藍
@@ -247,10 +247,10 @@ SUMMARY_PROMPT_TEMPLATE = """\
 """
 
 SUMMARY_PROMPT_DIARIZE_TEMPLATE = """\
-你是專業的會議記錄整理員。請根據以下含有說話者標記的逐字稿，完成兩件事：
+你是專業的會議記錄整理員。請根據以下含有講者標記的逐字稿，完成兩件事：
 
 1. **重點摘要**：列出 5-10 個重點，每個重點用一句話概述。
-2. **校正逐字稿**：將零碎的語音辨識結果整理成流暢、易讀的對話文字。合併同一位說話者的連續斷句、修正錯字，保留原始語意，不要增刪內容。不需要保留時間戳記。
+2. **校正逐字稿**：將零碎的語音辨識結果整理成流暢、易讀的對話文字。合併同一位講者的連續斷句、修正錯字，保留原始語意，不要增刪內容。不需要保留時間戳記。
 
 輸出格式：
 
@@ -271,9 +271,9 @@ Speaker 1：整理後的這段話內容。
 ...
 
 規則：
-- 逐字稿中 [Speaker N] 標記的是不同的說話者，校正後必須保留說話者標記，格式為「Speaker N：內容」
-- 同一位說話者的連續短句要合併成完整的段落，不要逐句列出
-- 不同說話者之間換行分隔
+- 逐字稿中 [Speaker N] 標記的是不同的講者，校正後必須保留講者標記，格式為「Speaker N：內容」
+- 同一位講者的連續短句要合併成完整的段落，不要逐句列出
+- 不同講者之間換行分隔
 - 逐字稿中 [EN] 標記的是英文原文語音辨識結果，[中] 標記的是中文翻譯。校正時請以中文翻譯為主，參考英文原文修正翻譯錯誤
 - 全部使用台灣繁體中文
 - 使用台灣用語（軟體、網路、記憶體、程式、伺服器等）
@@ -1124,7 +1124,7 @@ def select_translator():
 
 
 def _input_interactive_menu(args):
-    """--input 互動選單：選擇模式、說話者辨識、摘要"""
+    """--input 互動選單：選擇模式、講者辨識、摘要"""
 
     def _dw(s):
         return sum(2 if '\u4e00' <= c <= '\u9fff' else 1 for c in s)
@@ -1291,7 +1291,7 @@ def _input_interactive_menu(args):
                 o_idx = default_ollama
             ollama_model = translate_models[o_idx][0]
 
-        # ── 第四步：說話者辨識 ──
+        # ── 第四步：講者辨識 ──
         default_diarize = 1 if cli_diarize else 0
         diarize_options = [
             ("不辨識", ""),
@@ -1299,7 +1299,7 @@ def _input_interactive_menu(args):
             ("指定講者數", ""),
         ]
 
-        print(f"\n{C_TITLE}{BOLD}▎ 說話者辨識{RESET}")
+        print(f"\n{C_TITLE}{BOLD}▎ 講者辨識{RESET}")
         print(f"{C_DIM}{'─' * 60}{RESET}")
         col = max(_dw(l) for l, _ in diarize_options) + 2
         for i, (label, _) in enumerate(diarize_options):
@@ -1453,7 +1453,7 @@ def _input_interactive_menu(args):
         print(f"  {C_OK}→ {mode_name}{RESET}  {C_DIM}辨識: {fw_model}{RESET}")
         if ollama_model:
             print(f"  {C_OK}  翻譯: {ollama_model}{RESET}  {C_DIM}@ {ollama_host}:{ollama_port}{RESET}")
-        print(f"  {C_OK}  說話者辨識: {diarize_desc}{RESET}")
+        print(f"  {C_OK}  講者辨識: {diarize_desc}{RESET}")
         if do_summarize:
             print(f"  {C_OK}  摘要: {summary_model}{RESET}  {C_DIM}@ {ollama_host}:{ollama_port}{RESET}")
         print()
@@ -2590,7 +2590,7 @@ def _format_timestamp(seconds):
 
 
 def _diarize_segments(wav_path, segments, num_speakers=None, sbar=None):
-    """用 resemblyzer + spectralcluster 辨識說話者。
+    """用 resemblyzer + spectralcluster 辨識講者。
 
     segments: list of dict，每個含 start, end, text
     回傳: list of int（講者編號 0-based），失敗回傳 None
@@ -2602,7 +2602,7 @@ def _diarize_segments(wav_path, segments, num_speakers=None, sbar=None):
             from resemblyzer import VoiceEncoder, preprocess_wav
         from spectralcluster import SpectralClusterer
     except ImportError as e:
-        print(f"  {C_HIGHLIGHT}[錯誤] 說話者辨識需要額外套件: {e}{RESET}", file=sys.stderr)
+        print(f"  {C_HIGHLIGHT}[錯誤] 講者辨識需要額外套件: {e}{RESET}", file=sys.stderr)
         print(f"  {C_DIM}pip install resemblyzer spectralcluster{RESET}", file=sys.stderr)
         return None
 
@@ -2652,11 +2652,11 @@ def _diarize_segments(wav_path, segments, num_speakers=None, sbar=None):
             embeddings.append(None)
 
     if not valid_indices:
-        print(f"  {C_HIGHLIGHT}[警告] 無法提取任何有效聲紋，跳過說話者辨識{RESET}")
+        print(f"  {C_HIGHLIGHT}[警告] 無法提取任何有效聲紋，跳過講者辨識{RESET}")
         return None
 
     if sbar:
-        sbar.set_task("分群辨識說話者")
+        sbar.set_task("分群辨識講者")
 
     # 組合有效 embedding 矩陣
     import numpy as np
@@ -2828,7 +2828,7 @@ def process_audio_file(input_path, mode, translator, model_size="large-v3-turbo"
         sbar.set_task(f"辨識完成（{len(valid_segments)} 段）")
         sbar.set_progress("")
 
-        # 說話者辨識
+        # 講者辨識
         speaker_labels = None
         if diarize and valid_segments:
             speaker_labels = _diarize_segments(wav_path, valid_segments,
@@ -2845,7 +2845,7 @@ def process_audio_file(input_path, mode, translator, model_size="large-v3-turbo"
 
                 sbar.set_task(f"輸出中（{seg_count}/{len(valid_segments)}）")
 
-                # 說話者標籤
+                # 講者標籤
                 spk_tag_term = ""  # 終端機用（帶色彩）
                 spk_tag_log = ""   # log 用（純文字）
                 if speaker_labels is not None:
@@ -3222,12 +3222,12 @@ def parse_args():
         ("./start.sh --input meeting.mp3 --mode en2zh", "離線處理（直接執行，跳過選單）"),
         ("./start.sh --input meeting.mp3 --mode en", "離線處理（純英文轉錄）"),
         ("./start.sh --input f1.mp3 f2.m4a --summarize", "離線處理 + 摘要"),
-        ("./start.sh --input meeting.mp3 --diarize", "離線處理 + 說話者辨識"),
-        ("./start.sh --input meeting.mp3 --diarize --mode zh", "中文逐字稿 + 說話者辨識"),
+        ("./start.sh --input meeting.mp3 --diarize", "離線處理 + 講者辨識"),
+        ("./start.sh --input meeting.mp3 --diarize --mode zh", "中文逐字稿 + 講者辨識"),
         ("./start.sh --input meeting.mp3 --mode zh --summarize", "中文逐字稿 + 摘要修正"),
         ("./start.sh --input meeting.mp3 --diarize --num-speakers 3", "指定 3 位講者"),
         ("./start.sh --input meeting.mp3 --diarize --summarize", "辨識 + 翻譯 + 摘要"),
-        ("./start.sh --input m.mp3 --diarize --mode zh --summarize", "中文辨識 + 說話者 + 摘要"),
+        ("./start.sh --input m.mp3 --diarize --mode zh --summarize", "中文辨識 + 講者 + 摘要"),
         ("./start.sh --summarize log1.txt log2.txt", "批次摘要記錄檔"),
     ]
     col = max(len(cmd) for cmd, _ in examples) + 3
@@ -3282,7 +3282,7 @@ def parse_args():
         help=f"摘要用的 LLM 模型 (預設 {SUMMARY_DEFAULT_MODEL})")
     parser.add_argument(
         "--diarize", action="store_true",
-        help="說話者辨識（需搭配 --input，用 resemblyzer + spectralcluster）")
+        help="講者辨識（需搭配 --input，用 resemblyzer + spectralcluster）")
     parser.add_argument(
         "--num-speakers", type=int, metavar="N",
         help="指定講者人數（預設自動偵測 2~8，需搭配 --diarize）")
@@ -3395,7 +3395,7 @@ def main():
                     import resemblyzer  # noqa: F401
                 import spectralcluster  # noqa: F401
             except ImportError as e:
-                print(f"{C_HIGHLIGHT}[錯誤] 說話者辨識需要額外套件: {e}{RESET}", file=sys.stderr)
+                print(f"{C_HIGHLIGHT}[錯誤] 講者辨識需要額外套件: {e}{RESET}", file=sys.stderr)
                 print(f"  {C_DIM}pip install resemblyzer spectralcluster{RESET}", file=sys.stderr)
                 sys.exit(1)
 
@@ -3449,7 +3449,7 @@ def main():
         print(f"  {C_WHITE}辨識模型    {fw_model}{RESET}")
         if diarize:
             sp_info = f"啟用（{num_speakers} 人）" if num_speakers else "啟用（自動偵測）"
-            print(f"  {C_WHITE}說話者辨識  {sp_info}{RESET}")
+            print(f"  {C_WHITE}講者辨識  {sp_info}{RESET}")
         print(f"  {C_WHITE}檔案數      {RESET}{C_DIM}{len(args.input)}{RESET}")
 
         # 逐檔處理
