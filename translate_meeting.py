@@ -9,6 +9,7 @@ Author: Jason Cheng (Jason Tools)
 
 import argparse
 import atexit
+import math
 import os
 import re
 import select
@@ -19,6 +20,7 @@ import termios
 import threading
 import time
 import wave
+from collections import deque
 
 # 避免 OpenMP 重複載入衝突
 os.environ["KMP_DUPLICATE_LIB_OK"] = "TRUE"
@@ -153,8 +155,8 @@ OLLAMA_PORT = _config.get("ollama_port", OLLAMA_DEFAULT_PORT)
 
 # 內建翻譯模型（作者篩選推薦）
 _BUILTIN_TRANSLATE_MODELS = [
-    ("qwen2.5:14b", "品質好，速度快（推薦）"),
     ("phi4:14b", "Microsoft，品質最好"),
+    ("qwen2.5:14b", "品質好，速度快（推薦）"),
     ("qwen2.5:7b", "品質普通，速度最快"),
 ]
 
@@ -175,6 +177,7 @@ MODE_PRESETS = [
     ("zh2en", "中翻英字幕", "中文語音 → 翻譯成英文"),
     ("en", "英文轉錄", "英文語音 → 直接顯示英文"),
     ("zh", "中文轉錄", "中文語音 → 直接顯示繁體中文"),
+    ("record", "純錄音", "僅錄製音訊為 WAV 檔"),
 ]
 
 # 可用的 whisper 模型（由小到大）
@@ -206,7 +209,7 @@ ASR_ENGINES = [
     ("moonshine", "Moonshine", "真串流，低延遲，僅英文"),
 ]
 
-APP_VERSION = "1.7.9"
+APP_VERSION = "1.8.3"
 
 # 常見 LLM 伺服器預設 port（供參考）
 LLM_PRESETS = [
@@ -370,7 +373,7 @@ def select_mode():
     """讓用戶選擇功能模式"""
     default_idx = 0  # 預設：英翻中
 
-    print(f"\n{C_TITLE}{BOLD}▎ 功能模式{RESET}")
+    print(f"\n\n{C_TITLE}{BOLD}▎ 功能模式{RESET}")
     print(f"{C_DIM}{'─' * 60}{RESET}")
     # 計算顯示寬度（中文字佔 2 格）
     def _dw(s):
@@ -425,7 +428,7 @@ def select_whisper_model(mode="en2zh"):
         print(f"使用模型: {available[0][0]} ({available[0][2]})\n")
         return available[0][0], available[0][1]
 
-    print(f"\n{C_TITLE}{BOLD}▎ 語音辨識模型{RESET}")
+    print(f"\n\n{C_TITLE}{BOLD}▎ 語音辨識模型{RESET}")
     print(f"{C_DIM}{'─' * 60}{RESET}")
     default_model = "large-v3" if mode in ("zh", "zh2en") else "large-v3-turbo"
     default_idx = 0
@@ -471,7 +474,7 @@ def select_scene():
 
     default_idx = 1  # 預設：教育訓練
 
-    print(f"\n{C_TITLE}{BOLD}▎ 使用場景{RESET}")
+    print(f"\n\n{C_TITLE}{BOLD}▎ 使用場景{RESET}")
     print(f"{C_DIM}{'─' * 60}{RESET}")
     for i, (name, length, step, desc) in enumerate(SCENE_PRESETS):
         if i == default_idx:
@@ -589,7 +592,7 @@ def select_asr_engine():
 
     default_idx = 0  # Moonshine
 
-    print(f"\n{C_TITLE}{BOLD}▎ 語音辨識引擎{RESET}")
+    print(f"\n\n{C_TITLE}{BOLD}▎ 語音辨識引擎{RESET}")
     print(f"{C_DIM}{'─' * 60}{RESET}")
     for i, (key, name, desc) in enumerate(ASR_ENGINES):
         if i == default_idx:
@@ -624,7 +627,7 @@ def select_moonshine_model():
     """讓使用者選擇 Moonshine 串流模型"""
     default_idx = 0  # medium
 
-    print(f"\n{C_TITLE}{BOLD}▎ Moonshine 語音模型{RESET}")
+    print(f"\n\n{C_TITLE}{BOLD}▎ Moonshine 語音模型{RESET}")
     print(f"{C_DIM}{'─' * 60}{RESET}")
     for i, (name, desc, size) in enumerate(MOONSHINE_MODELS):
         label = f"{name:8s} {size}"
@@ -684,7 +687,7 @@ def list_audio_devices_sd():
     print(f"{C_WARN}[提醒] 未偵測到 BlackHole，請手動選擇音訊裝置{RESET}")
     default_id = input_devices[0][0]
 
-    print(f"\n{C_TITLE}{BOLD}▎ 音訊裝置{RESET}")
+    print(f"\n\n{C_TITLE}{BOLD}▎ 音訊裝置{RESET}")
     print(f"{C_DIM}{'─' * 60}{RESET}")
     for dev_id, dev_name, ch, sr in input_devices:
         info = f"{ch}ch {sr}Hz"
@@ -1060,7 +1063,7 @@ def select_translator():
     host = OLLAMA_HOST
     port = OLLAMA_PORT
 
-    print(f"\n{C_TITLE}{BOLD}▎ 翻譯引擎{RESET}")
+    print(f"\n\n{C_TITLE}{BOLD}▎ 翻譯引擎{RESET}")
     print(f"{C_DIM}{'─' * 60}{RESET}")
 
     # 先自動偵測預設 LLM 伺服器
@@ -1122,9 +1125,16 @@ def select_translator():
 
     col = max(_dw(label) for label, *_ in options) + 2
 
+    # 預設選 qwen2.5:14b（若有），否則第一個
+    default_idx = 0
+    for i, (_, _, eng, mod) in enumerate(options):
+        if mod == "qwen2.5:14b":
+            default_idx = i
+            break
+
     for i, (label, desc, engine, model) in enumerate(options):
         padded = label + ' ' * (col - _dw(label))
-        if i == 0:
+        if i == default_idx:
             print(f"  {C_HIGHLIGHT}{BOLD}[{i}] {padded}{RESET} {C_WHITE}{desc}{RESET}  {C_HIGHLIGHT}{REVERSE} 預設 {RESET}")
         else:
             print(f"  {C_DIM}[{i}]{RESET} {C_WHITE}{padded}{RESET} {C_DIM}{desc}{RESET}")
@@ -1137,7 +1147,7 @@ def select_translator():
         print()
         sys.exit(0)
 
-    idx = 0
+    idx = default_idx
     if user_input:
         try:
             idx = int(user_input)
@@ -1162,7 +1172,7 @@ def _input_interactive_menu(args):
 
     try:
         # 顯示輸入檔案資訊
-        print(f"\n{C_TITLE}{BOLD}▎ 離線處理音訊檔{RESET}")
+        print(f"\n\n{C_TITLE}{BOLD}▎ 離線處理音訊檔{RESET}")
         print(f"{C_DIM}{'─' * 60}{RESET}")
         for fpath in args.input:
             fname = os.path.basename(fpath)
@@ -1185,10 +1195,13 @@ def _input_interactive_menu(args):
         # 如果 CLI 帶了 --diarize，預設辨識選項改為「自動偵測」
         cli_diarize = args.diarize
 
-        print(f"\n{C_TITLE}{BOLD}▎ 功能模式{RESET}")
+        # 離線處理過濾掉「純錄音」模式
+        input_modes = [(k, n, d) for k, n, d in MODE_PRESETS if k != "record"]
+
+        print(f"\n\n{C_TITLE}{BOLD}▎ 功能模式{RESET}")
         print(f"{C_DIM}{'─' * 60}{RESET}")
-        col = max(_dw(name) for _, name, _ in MODE_PRESETS) + 2
-        for i, (key, name, desc) in enumerate(MODE_PRESETS):
+        col = max(_dw(name) for _, name, _ in input_modes) + 2
+        for i, (key, name, desc) in enumerate(input_modes):
             padded = name + ' ' * (col - _dw(name))
             if i == default_mode:
                 print(f"  {C_HIGHLIGHT}{BOLD}[{i}] {padded}{RESET} {C_WHITE}{desc}{RESET}  {C_HIGHLIGHT}{REVERSE} 預設 {RESET}")
@@ -1201,13 +1214,13 @@ def _input_interactive_menu(args):
         if user_input:
             try:
                 idx = int(user_input)
-                if not (0 <= idx < len(MODE_PRESETS)):
+                if not (0 <= idx < len(input_modes)):
                     idx = default_mode
             except ValueError:
                 idx = default_mode
         else:
             idx = default_mode
-        mode_key, mode_name, mode_desc = MODE_PRESETS[idx]
+        mode_key, mode_name, mode_desc = input_modes[idx]
         is_chinese = mode_key in ("zh", "zh2en")
         need_translate = mode_key in ("en2zh", "zh2en")
 
@@ -1225,7 +1238,7 @@ def _input_interactive_menu(args):
                 default_fw = i
                 break
 
-        print(f"\n{C_TITLE}{BOLD}▎ 辨識模型{RESET}")
+        print(f"\n\n{C_TITLE}{BOLD}▎ 辨識模型{RESET}")
         print(f"{C_DIM}{'─' * 60}{RESET}")
         col = max(len(name) for name, _ in available_models) + 2
         for i, (name, desc) in enumerate(available_models):
@@ -1259,7 +1272,7 @@ def _input_interactive_menu(args):
         if need_translate:
             # LLM 伺服器
             default_addr = f"{ollama_host}:{ollama_port}"
-            print(f"\n{C_TITLE}{BOLD}▎ LLM 伺服器{RESET}")
+            print(f"\n\n{C_TITLE}{BOLD}▎ LLM 伺服器{RESET}")
             print(f"{C_DIM}{'─' * 60}{RESET}")
             print(f"  {C_WHITE}目前設定: {default_addr}{RESET}")
             print(f"{C_DIM}{'─' * 60}{RESET}")
@@ -1298,7 +1311,11 @@ def _input_interactive_menu(args):
                 llm_server_type = "ollama"  # 預設假設 Ollama，實際連線時再偵測
 
             default_ollama = 0
-            print(f"\n{C_TITLE}{BOLD}▎ 翻譯模型{RESET}")
+            for i, (name, _) in enumerate(translate_models):
+                if name == "qwen2.5:14b":
+                    default_ollama = i
+                    break
+            print(f"\n\n{C_TITLE}{BOLD}▎ 翻譯模型{RESET}")
             print(f"{C_DIM}{'─' * 60}{RESET}")
             col = max(len(name) for name, _ in translate_models) + 2
             for i, (name, desc) in enumerate(translate_models):
@@ -1330,7 +1347,7 @@ def _input_interactive_menu(args):
             ("指定講者數", ""),
         ]
 
-        print(f"\n{C_TITLE}{BOLD}▎ 講者辨識{RESET}")
+        print(f"\n\n{C_TITLE}{BOLD}▎ 講者辨識{RESET}")
         print(f"{C_DIM}{'─' * 60}{RESET}")
         col = max(_dw(l) for l, _ in diarize_options) + 2
         for i, (label, _) in enumerate(diarize_options):
@@ -1376,7 +1393,7 @@ def _input_interactive_menu(args):
             ("產生摘要與校正逐字稿", ""),
         ]
 
-        print(f"\n{C_TITLE}{BOLD}▎ 摘要與逐字稿校正{RESET}")
+        print(f"\n\n{C_TITLE}{BOLD}▎ 摘要與逐字稿校正{RESET}")
         print(f"{C_DIM}{'─' * 60}{RESET}")
         col = max(_dw(l) for l, _ in summarize_options) + 2
         for i, (label, _) in enumerate(summarize_options):
@@ -1405,7 +1422,7 @@ def _input_interactive_menu(args):
         if do_summarize:
             if not ollama_asked:
                 default_addr = f"{ollama_host}:{ollama_port}"
-                print(f"\n{C_TITLE}{BOLD}▎ LLM 伺服器{RESET}")
+                print(f"\n\n{C_TITLE}{BOLD}▎ LLM 伺服器{RESET}")
                 print(f"{C_DIM}{'─' * 60}{RESET}")
                 print(f"  {C_WHITE}目前設定: {default_addr}{RESET}")
                 print(f"{C_DIM}{'─' * 60}{RESET}")
@@ -1443,7 +1460,7 @@ def _input_interactive_menu(args):
                 llm_server_type = "ollama"  # 預設假設 Ollama，實際連線時再偵測
 
             default_sm = 0
-            print(f"\n{C_TITLE}{BOLD}▎ 摘要模型{RESET}")
+            print(f"\n\n{C_TITLE}{BOLD}▎ 摘要模型{RESET}")
             print(f"{C_DIM}{'─' * 60}{RESET}")
             col = max(len(name) for name, _ in summary_models_list) + 2
             for i, (name, desc) in enumerate(summary_models_list):
@@ -1553,6 +1570,7 @@ def run_stream(capture_id: int, translator, model_name: str, model_path: str,
 
         def rec_callback(indata, frames, time_info, status):
             recorder.write_raw(indata)
+            _push_rms(float(np.sqrt(np.mean(indata ** 2))))
 
         try:
             rec_stream = sd.InputStream(device=rec_dev_id, samplerate=rec_sr,
@@ -1603,11 +1621,15 @@ def run_stream(capture_id: int, translator, model_name: str, model_path: str,
     ctrl_s_pressed = threading.Event()
     stop_keypress = threading.Event()
 
+    # 被動音量監控（稍後初始化，signal_handler 透過閉包取得）
+    audio_monitor = None
+
     # 設定 signal handler
     def signal_handler(signum, frame):
         clear_status_bar()
         restore_terminal()
         stop_keypress.set()
+        _stop_audio_monitor(audio_monitor)
         # 停止錄音
         if rec_stream:
             try:
@@ -1678,6 +1700,10 @@ def run_stream(capture_id: int, translator, model_name: str, model_path: str,
     setup_status_bar(mode)
     signal.signal(signal.SIGWINCH, _handle_sigwinch)
 
+    # 被動音量監控（Whisper 無錄音時，開輕量 stream 讀 BlackHole 給狀態列波形）
+    if not record:
+        audio_monitor = _start_audio_monitor()
+
     # 非同步翻譯：英文立刻顯示，中文在背景翻完再補上
     print_lock = threading.Lock()
 
@@ -1722,9 +1748,9 @@ def run_stream(capture_id: int, translator, model_name: str, model_path: str,
             if ctrl_s_pressed.is_set():
                 break
 
-            # 每約 1 秒更新狀態列時間
+            # 每約 0.2 秒更新狀態列（含波形）
             _loop_tick += 1
-            if _loop_tick >= 10 and _status_bar_active:
+            if _loop_tick >= 2 and _status_bar_active:
                 _loop_tick = 0
                 refresh_status_bar()
 
@@ -1861,6 +1887,7 @@ def run_stream(capture_id: int, translator, model_name: str, model_path: str,
     clear_status_bar()
     restore_terminal()
     stop_keypress.set()
+    _stop_audio_monitor(audio_monitor)
 
     # 停止錄音
     if rec_stream:
@@ -1895,7 +1922,7 @@ def run_stream(capture_id: int, translator, model_name: str, model_path: str,
             print(f"{C_HIGHLIGHT}[跳過] 沒有轉錄記錄，無法生成摘要{RESET}")
             sys.exit(0)
 
-        print(f"\n{C_TITLE}{BOLD}▎ 生成摘要{RESET}")
+        print(f"\n\n{C_TITLE}{BOLD}▎ 生成摘要{RESET}")
         print(f"{C_DIM}{'─' * 60}{RESET}")
         print(f"  {C_DIM}記錄檔: {log_path}{RESET}")
         print(f"  {C_DIM}摘要模型: {summary_model} ({summary_host}:{summary_port}){RESET}")
@@ -2133,6 +2160,7 @@ def run_stream_moonshine(capture_id: int, translator, moonshine_model_name: str,
             audio = audio.mean(axis=1)
         else:
             audio = audio.flatten()
+        _push_rms(float(np.sqrt(np.mean(audio ** 2))))
         if recorder and rec_stream is None:
             # 同裝置錄音：寫入 mono
             recorder.write(audio)
@@ -2213,10 +2241,10 @@ def run_stream_moonshine(capture_id: int, translator, moonshine_model_name: str,
     setup_status_bar(mode)
     signal.signal(signal.SIGWINCH, _handle_sigwinch)
 
-    # 主迴圈：等待 Ctrl+C 或 Ctrl+S，每秒更新狀態列時間
+    # 主迴圈：等待 Ctrl+C 或 Ctrl+S，每 0.2 秒更新狀態列（含波形）
     try:
         while not ctrl_s_pressed.is_set() and not stop_event.is_set():
-            time.sleep(1.0)
+            time.sleep(0.2)
             if _status_bar_active:
                 with print_lock:
                     refresh_status_bar()
@@ -2240,7 +2268,7 @@ def run_stream_moonshine(capture_id: int, translator, moonshine_model_name: str,
             print(f"{C_HIGHLIGHT}[跳過] 沒有轉錄記錄，無法生成摘要{RESET}")
             sys.exit(0)
 
-        print(f"\n{C_TITLE}{BOLD}▎ 生成摘要{RESET}")
+        print(f"\n\n{C_TITLE}{BOLD}▎ 生成摘要{RESET}")
         print(f"{C_DIM}{'─' * 60}{RESET}")
         print(f"  {C_DIM}記錄檔: {log_path}{RESET}")
         print(f"  {C_DIM}摘要模型: {summary_model} ({summary_host}:{summary_port}){RESET}")
@@ -2400,6 +2428,445 @@ class _AudioRecorder:
         return self.path
 
 
+def _auto_detect_rec_device():
+    """自動偵測錄音裝置。回傳 (device_id, device_name, label) 或 (None, None, None)"""
+    import sounddevice as sd
+    devices = sd.query_devices()
+    # 1) 聚集裝置
+    for i, dev in enumerate(devices):
+        if dev["max_input_channels"] > 0:
+            name = dev["name"]
+            if "聚集" in name or "aggregate" in name.lower():
+                return i, name, "雙方聲音"
+    # 2) input channels >= 3 的 Apple 虛擬裝置
+    for i, dev in enumerate(devices):
+        if (dev["max_input_channels"] >= 3
+                and "blackhole" not in dev["name"].lower()):
+            return i, dev["name"], "雙方聲音"
+    # 3) BlackHole
+    for i, dev in enumerate(devices):
+        if dev["max_input_channels"] > 0 and "blackhole" in dev["name"].lower():
+            return i, dev["name"], "僅對方聲音"
+    return None, None, None
+
+
+def _ask_record_source():
+    """純錄音模式：選擇錄音來源（雙方聲音 / 僅對方聲音）。
+    回傳 (device_id, device_name, label)，找不到裝置則 sys.exit(1)。"""
+    import sounddevice as sd
+    devices = sd.query_devices()
+
+    # 偵測可用裝置
+    aggregate_dev = None   # 聚集裝置（雙方聲音）
+    blackhole_dev = None   # BlackHole（僅對方聲音）
+
+    for i, dev in enumerate(devices):
+        if dev["max_input_channels"] <= 0:
+            continue
+        name = dev["name"]
+        # 聚集裝置
+        if aggregate_dev is None:
+            if "聚集" in name or "aggregate" in name.lower():
+                aggregate_dev = (i, name)
+            elif dev["max_input_channels"] >= 3 and "blackhole" not in name.lower():
+                aggregate_dev = (i, name)
+        # BlackHole
+        if blackhole_dev is None and "blackhole" in name.lower():
+            blackhole_dev = (i, name)
+
+    # 兩種裝置都找不到 → 用系統預設
+    if aggregate_dev is None and blackhole_dev is None:
+        default = sd.default.device[0]
+        if default is not None and default >= 0:
+            dev = sd.query_devices(default)
+            print(f"{C_HIGHLIGHT}[提醒] 未偵測到聚集裝置或 BlackHole，使用系統預設輸入{RESET}")
+            return default, dev["name"], "系統預設"
+        print("[錯誤] 找不到任何音訊輸入裝置！", file=sys.stderr)
+        sys.exit(1)
+
+    # 只有一種裝置 → 直接使用
+    if aggregate_dev is None:
+        return blackhole_dev[0], blackhole_dev[1], "僅對方聲音"
+    if blackhole_dev is None:
+        return aggregate_dev[0], aggregate_dev[1], "雙方聲音"
+
+    # 兩種都有 → 讓使用者選擇
+    print(f"\n\n{C_TITLE}{BOLD}▎ 錄音來源{RESET}")
+    print(f"{C_DIM}{'─' * 60}{RESET}")
+    print(f"  {C_HIGHLIGHT}{BOLD}[0] 雙方聲音{RESET}  {C_WHITE}對方播放 + 我方麥克風{RESET}  {C_HIGHLIGHT}{REVERSE} 預設 {RESET}")
+    print(f"  {C_DIM}    {aggregate_dev[1]}{RESET}")
+    print(f"  {C_DIM}[1]{RESET} {C_WHITE}僅對方聲音{RESET}  {C_DIM}只錄製系統播放的聲音{RESET}")
+    print(f"  {C_DIM}    {blackhole_dev[1]}{RESET}")
+    print(f"{C_DIM}{'─' * 60}{RESET}")
+    print(f"{C_WHITE}選擇 (0-1) [0]：{RESET}", end=" ")
+
+    try:
+        user_input = input().strip()
+    except (EOFError, KeyboardInterrupt):
+        print()
+        sys.exit(0)
+
+    if user_input == "1":
+        print(f"  {C_OK}→ 僅對方聲音{RESET}")
+        return blackhole_dev[0], blackhole_dev[1], "僅對方聲音"
+    else:
+        print(f"  {C_OK}→ 雙方聲音{RESET}")
+        return aggregate_dev[0], aggregate_dev[1], "雙方聲音"
+
+
+def run_record_only(rec_device):
+    """純錄音模式：僅錄製音訊為 WAV 檔，不做 ASR 或翻譯。
+    聚集裝置（ch>=3）自動分離輸出/輸入音軌並分開顯示波形。"""
+    import sounddevice as sd
+    import numpy as np
+
+    dev_info = sd.query_devices(rec_device)
+    rec_sr = int(dev_info["default_samplerate"])
+    rec_ch = max(dev_info["max_input_channels"], 1)
+    dev_name = dev_info["name"]
+
+    # 判斷是否為聚集裝置（ch >= 3：前 N-1 ch 為播放音訊，最後 1 ch 為麥克風）
+    is_aggregate = rec_ch >= 3
+    out_channels = rec_ch - 1 if is_aggregate else rec_ch  # 播放音軌數
+    # 如果是 BlackHole (2ch)，全部都是播放音訊
+
+    recorder = _AudioRecorder(rec_sr, rec_ch)
+    stop_event = threading.Event()
+
+    # 滾動音量歷史（用於波形顯示）
+    _WAVE_MAX = 80  # 最多保留 80 筆歷史（約 8 秒）
+    _level_lock = threading.Lock()
+    if is_aggregate:
+        _out_history = deque(maxlen=_WAVE_MAX)  # 播放音訊（對方聲音）
+        _in_history = deque(maxlen=_WAVE_MAX)   # 麥克風（我方聲音）
+    else:
+        _out_history = deque(maxlen=_WAVE_MAX)  # 單軌
+        _in_history = None
+
+    def rec_callback(indata, frames, time_info, status):
+        if stop_event.is_set():
+            return
+        recorder.write_raw(indata)
+        data = indata.astype(np.float32)
+        if is_aggregate:
+            # 前 N-1 聲道：播放音訊（對方）
+            out_rms = float(np.sqrt(np.mean(data[:, :out_channels] ** 2)))
+            # 最後 1 聲道：麥克風（我方）
+            in_rms = float(np.sqrt(np.mean(data[:, -1] ** 2)))
+            with _level_lock:
+                _out_history.append(out_rms)
+                _in_history.append(in_rms)
+        else:
+            rms = float(np.sqrt(np.mean(data ** 2)))
+            with _level_lock:
+                _out_history.append(rms)
+
+    try:
+        stream = sd.InputStream(device=rec_device, samplerate=rec_sr,
+                                channels=rec_ch, dtype="float32",
+                                blocksize=int(rec_sr * 0.1),
+                                callback=rec_callback)
+    except Exception as e:
+        print(f"[錯誤] 無法開啟錄音裝置 [{rec_device}] {dev_name}: {e}", file=sys.stderr)
+        recorder.close()
+        sys.exit(1)
+
+    # Banner
+    print(f"\n{C_TITLE}{'=' * 60}{RESET}")
+    print(f"{C_TITLE}{BOLD}  {APP_NAME}{RESET}")
+    print(f"{C_TITLE}  {APP_AUTHOR}{RESET}")
+    print(f"  {C_DIM}模式: 純錄音{RESET}")
+    print(f"  {C_DIM}裝置: [{rec_device}] {dev_name} ({rec_ch}ch {rec_sr}Hz){RESET}")
+    print(f"  {C_DIM}錄音: {recorder.path}{RESET}")
+    if is_aggregate:
+        print(f"  {C_DIM}音軌: 輸出 {out_channels}ch（對方） + 輸入 1ch（我方）{RESET}")
+    print(f"  {C_DIM}按 Ctrl+C 停止錄音{RESET}")
+    print(f"{C_TITLE}{'=' * 60}{RESET}")
+    print()
+
+    stream.start()
+    start_time = time.monotonic()
+
+    def _level_color(level):
+        if level > 0.05:
+            return C_OK         # 綠色
+        elif level > 0.003:
+            return C_HIGHLIGHT  # 黃色
+        return C_DIM            # 灰色
+
+    def _build_wave(history, bar_width):
+        samples = list(history)
+        if len(samples) >= bar_width:
+            samples = samples[-bar_width:]
+        else:
+            samples = [0.0] * (bar_width - len(samples)) + samples
+        cur = samples[-1] if samples else 0.0
+        wave = "".join(_rms_to_bar(s) for s in samples)
+        return wave, cur
+
+    _first_draw = True
+    _prev_cols = [0]
+
+    # SIGWINCH 偵測視窗大小變化
+    _resized = [False]
+    def _on_winch(signum, frame):
+        _resized[0] = True
+    signal.signal(signal.SIGWINCH, _on_winch)
+
+    # 固定時間欄位寬度（容納 H:MM:SS），波形寬度不會因跨時而跳動
+    _TS_W = 7  # "H:MM:SS" = 7 字元，"MM:SS" 右對齊補空格
+
+    # 雙軌前綴: "  " + ts(7) + "  " + "輸出"(4) + " "(1) = 16
+    # 單軌前綴: "  " + ts(7) + "  " = 11
+    if is_aggregate:
+        _BAR_W = max(60 - (_TS_W + 9), 10)  # 60 - 16 = 44
+    else:
+        _BAR_W = max(60 - (_TS_W + 4), 10)  # 60 - 11 = 49
+
+    try:
+        while True:
+            time.sleep(0.15)
+            elapsed = time.monotonic() - start_time
+            secs = int(elapsed)
+            if secs >= 3600:
+                ts_raw = f"{secs // 3600}:{(secs % 3600) // 60:02d}:{secs % 60:02d}"
+            else:
+                ts_raw = f"{secs // 60:02d}:{secs % 60:02d}"
+            ts = ts_raw.rjust(_TS_W)
+
+            try:
+                cols = os.get_terminal_size().columns
+            except Exception:
+                cols = 80
+
+            # 視窗大小變化：重置繪製（避免殘留行錯位）
+            if _resized[0] or cols != _prev_cols[0]:
+                _resized[0] = False
+                _prev_cols[0] = cols
+                if not _first_draw:
+                    sys.stdout.write("\x1b[1A\r\x1b[J")
+                    sys.stdout.flush()
+                    _first_draw = True
+
+            if is_aggregate:
+                with _level_lock:
+                    out_wave, out_cur = _build_wave(_out_history, _BAR_W)
+                    in_wave, in_cur = _build_wave(_in_history, _BAR_W)
+
+                out_color = _level_color(out_cur)
+                in_color = _level_color(in_cur)
+
+                out_line = f"  {C_WHITE}{BOLD}{ts}{RESET}  {C_TITLE}輸出{RESET} {out_color}{out_wave}{RESET}"
+                in_line = f"  {' ' * _TS_W}  {C_HIGHLIGHT}輸入{RESET} {in_color}{in_wave}{RESET}"
+
+                if _first_draw:
+                    sys.stdout.write(f"\r\x1b[K{out_line}\n\r\x1b[K{in_line}")
+                    sys.stdout.flush()
+                    _first_draw = False
+                else:
+                    sys.stdout.write(f"\x1b[1A\r\x1b[K{out_line}\n\r\x1b[K{in_line}")
+                    sys.stdout.flush()
+            else:
+                with _level_lock:
+                    wave_str, cur_level = _build_wave(_out_history, _BAR_W)
+                vol_color = _level_color(cur_level)
+                line = f"  {C_WHITE}{BOLD}{ts}{RESET}  {vol_color}{wave_str}{RESET}"
+                sys.stdout.write(f"\r\x1b[K{line}")
+                sys.stdout.flush()
+
+    except KeyboardInterrupt:
+        pass
+    finally:
+        stop_event.set()
+        stream.stop()
+        stream.close()
+        path = recorder.close()
+        elapsed = time.monotonic() - start_time
+        secs = int(elapsed)
+        if secs >= 3600:
+            ts = f"{secs // 3600}:{(secs % 3600) // 60:02d}:{secs % 60:02d}"
+        else:
+            ts = f"{secs // 60:02d}:{secs % 60:02d}"
+        print()
+        print(f"\n{C_OK}{BOLD}錄音完成{RESET}")
+        print(f"  {C_WHITE}時長: {ts}{RESET}")
+        print(f"  {C_WHITE}檔案: {path}{RESET}")
+        print()
+
+
+def _select_audio_files():
+    """掃描 RECORDING_DIR，列出音訊檔供選擇（每頁 10 筆，可翻頁）。
+    回傳 [filepath] (list)，或 None 表示無檔案。"""
+    AUDIO_EXTS = {".wav", ".mp3", ".m4a", ".flac", ".ogg"}
+    PAGE_SIZE = 10
+    files = []
+    if os.path.isdir(RECORDING_DIR):
+        for fname in os.listdir(RECORDING_DIR):
+            ext = os.path.splitext(fname)[1].lower()
+            if ext in AUDIO_EXTS:
+                fpath = os.path.join(RECORDING_DIR, fname)
+                if os.path.isfile(fpath):
+                    files.append((fpath, os.path.getmtime(fpath)))
+    if not files:
+        return None
+    # 按修改時間倒序
+    files.sort(key=lambda x: x[1], reverse=True)
+
+    def _human_size(size):
+        if size >= 1024 * 1024 * 1024:
+            return f"{size / (1024 ** 3):.1f} GB"
+        elif size >= 1024 * 1024:
+            return f"{size / (1024 ** 2):.1f} MB"
+        else:
+            return f"{size / 1024:.0f} KB"
+
+    import time as _time
+    import struct as _struct
+
+    def _dw(s):
+        """計算字串顯示寬度（中日韓字元佔 2 格）"""
+        return sum(2 if '\u4e00' <= c <= '\u9fff' or '\u3000' <= c <= '\u30ff'
+                     or '\uff00' <= c <= '\uffef' else 1 for c in s)
+
+    def _wav_duration(fpath):
+        """從 WAV header 快速讀取時長（秒），失敗回傳 None"""
+        try:
+            with open(fpath, "rb") as f:
+                riff = f.read(12)
+                if riff[:4] != b"RIFF" or riff[8:12] != b"WAVE":
+                    return None
+                while True:
+                    chunk_hdr = f.read(8)
+                    if len(chunk_hdr) < 8:
+                        return None
+                    chunk_id = chunk_hdr[:4]
+                    chunk_size = _struct.unpack("<I", chunk_hdr[4:8])[0]
+                    if chunk_id == b"fmt ":
+                        fmt_data = f.read(chunk_size)
+                        channels = _struct.unpack("<H", fmt_data[2:4])[0]
+                        sample_rate = _struct.unpack("<I", fmt_data[4:8])[0]
+                        bits_per_sample = _struct.unpack("<H", fmt_data[14:16])[0]
+                        if sample_rate == 0 or channels == 0 or bits_per_sample == 0:
+                            return None
+                    elif chunk_id == b"data":
+                        bytes_per_sample = bits_per_sample // 8
+                        return chunk_size / (sample_rate * channels * bytes_per_sample)
+                    else:
+                        f.seek(chunk_size, 1)
+        except Exception:
+            return None
+
+    def _audio_duration(fpath):
+        """取得音訊時長（秒），WAV 直接讀 header，其他用 ffprobe"""
+        if fpath.lower().endswith(".wav"):
+            dur = _wav_duration(fpath)
+            if dur is not None:
+                return dur
+        probe = _ffprobe_info(fpath)
+        if probe:
+            return probe[0]
+        return None
+
+    def _fmt_duration(secs):
+        """格式化秒數為 H:MM:SS 或 M:SS，固定 7 字元右對齊"""
+        if secs is None:
+            return "--"
+        secs = int(secs)
+        h, m, s = secs // 3600, (secs % 3600) // 60, secs % 60
+        if h > 0:
+            return f"{h}:{m:02d}:{s:02d}"
+        return f"{m}:{s:02d}"
+
+    page = 0
+    while True:
+        start = page * PAGE_SIZE
+        end = min(start + PAGE_SIZE, len(files))
+        page_files = files[start:end]
+        has_next = end < len(files)
+        total = len(files)
+
+        # 動態計算檔名欄寬度（取當頁最寬 + 2，最小 40）
+        fname_col = max(max(_dw(os.path.basename(f)) for f, _ in page_files), 38) + 2
+
+        print(f"\n\n{C_TITLE}{BOLD}▎ 選擇音訊檔{RESET}  {C_DIM}（recordings/ 下共 {total} 個，顯示第 {start + 1}-{end} 個）{RESET}")
+        print(f"{C_DIM}{'─' * 60}{RESET}")
+        for i, (fpath, mtime) in enumerate(page_files):
+            num = start + i + 1
+            fname = os.path.basename(fpath)
+            size_str = _human_size(os.path.getsize(fpath))
+            dur_str = _fmt_duration(_audio_duration(fpath))
+            date_str = _time.strftime("%m/%d %H:%M", _time.localtime(mtime))
+            size_part = f"({size_str})"
+            pad = ' ' * (fname_col - _dw(fname))
+            info = f"{dur_str:>7s}  {size_part:>10s}  {date_str}"
+            if num == 1:
+                print(f"  {C_HIGHLIGHT}{BOLD}[{num:>2d}]{RESET} {C_WHITE}{fname}{RESET}{pad} {C_DIM}{info}{RESET}")
+            else:
+                print(f"  {C_DIM}[{num:>2d}]{RESET} {C_WHITE}{fname}{RESET}{pad} {C_DIM}{info}{RESET}")
+        if has_next:
+            next_num = end + 1
+            remain = total - end
+            print(f"  {C_DIM}[{next_num:>2d}]{RESET} {C_WHITE}... 顯示下 {min(PAGE_SIZE, remain)} 筆{RESET}")
+        print(f"{C_DIM}{'─' * 60}{RESET}")
+        print(f"{C_WHITE}選擇檔案編號 [1]：{RESET}", end=" ")
+
+        try:
+            user_input = input().strip()
+        except (EOFError, KeyboardInterrupt):
+            print()
+            sys.exit(0)
+
+        if user_input:
+            try:
+                choice = int(user_input)
+            except ValueError:
+                choice = 1
+            # 翻頁：輸入的編號 == end+1 且有下一頁
+            if has_next and choice == end + 1:
+                page += 1
+                continue
+            # 選擇檔案
+            idx = choice - 1
+            if not (0 <= idx < len(files)):
+                idx = 0
+        else:
+            idx = 0
+
+        chosen = files[idx][0]
+        print(f"  {C_OK}→ {os.path.basename(chosen)}{RESET}\n")
+        return [chosen]
+
+
+def _ask_input_source():
+    """互動選單第一步：選擇輸入來源。
+    回傳 ("realtime", None) 或 ("file", [filepath, ...])"""
+    while True:
+        print(f"\n\n{C_TITLE}{BOLD}▎ 輸入來源{RESET}")
+        print(f"{C_DIM}{'─' * 60}{RESET}")
+        print(f"  {C_HIGHLIGHT}{BOLD}[1] 即時音訊擷取{RESET}                                    {C_HIGHLIGHT}{REVERSE} 預設 {RESET}")
+        print(f"  {C_DIM}[2]{RESET} {C_WHITE}讀入音訊檔案{RESET}")
+        print(f"{C_DIM}{'─' * 60}{RESET}")
+        print(f"{C_WHITE}選擇 (1-2) [1]：{RESET}", end=" ")
+
+        try:
+            user_input = input().strip()
+        except (EOFError, KeyboardInterrupt):
+            print()
+            sys.exit(0)
+
+        if user_input == "2":
+            result = _select_audio_files()
+            if result is None:
+                print(f"  {C_HIGHLIGHT}recordings/ 目錄下沒有音訊檔{RESET}")
+                continue  # 回到輸入來源選單
+            print(f"  {C_OK}→ 讀入音訊檔案{RESET}")
+            return ("file", result)
+
+        # 預設或輸入 1
+        print(f"  {C_OK}→ 即時音訊擷取{RESET}\n")
+        return ("realtime", None)
+
+
 def _ask_record():
     """互動選單：詢問是否錄製音訊，自動偵測錄音裝置。
     回傳 (record: bool, rec_device: int or None)"""
@@ -2434,7 +2901,7 @@ def _ask_record():
                 rec_auto_label = "僅對方聲音"
                 break
 
-    print(f"\n{C_TITLE}{BOLD}▎ 錄製音訊{RESET}")
+    print(f"\n\n{C_TITLE}{BOLD}▎ 錄製音訊{RESET}")
     print(f"{C_DIM}{'─' * 60}{RESET}")
     print(f"  {C_WHITE}是否同時錄製音訊為 WAV 檔？（儲存於 recordings/）{RESET}")
     print(f"  {C_HIGHLIGHT}* 即時辨識僅處理播放聲音，無法包含我方說話的聲音{RESET}")
@@ -2471,7 +2938,7 @@ def _ask_record():
                                   int(dev["default_samplerate"])))
     default_id = input_devices[0][0] if input_devices else 0
 
-    print(f"\n{C_TITLE}{BOLD}▎ 錄音裝置{RESET}")
+    print(f"\n\n{C_TITLE}{BOLD}▎ 錄音裝置{RESET}")
     print(f"{C_DIM}{'─' * 60}{RESET}")
     for dev_id, dev_name, ch, sr in input_devices:
         info = f"{ch}ch {sr}Hz"
@@ -2505,10 +2972,10 @@ def _ask_record():
 def _ask_topic():
     """互動選單：詢問會議主題（可選，僅翻譯模式使用）。
     回傳主題字串，若使用者跳過則回傳 None。"""
-    print(f"\n{C_TITLE}{BOLD}▎ 會議主題（可選，提升翻譯品質）{RESET}")
+    print(f"\n\n{C_TITLE}{BOLD}▎ 會議主題（選填，提升翻譯品質）{RESET}")
     print(f"{C_DIM}{'─' * 60}{RESET}")
     print(f"  {C_WHITE}輸入此次會議的主題或領域，例如：K8s 安全架構、ZFS 儲存管理{RESET}")
-    print(f"  {C_DIM}直接按 Enter 跳過{RESET}")
+    print(f"  {C_DIM}若無特定主題要填寫，可直接按 Enter 跳過{RESET}")
     print(f"{C_DIM}{'─' * 60}{RESET}")
     print(f"{C_WHITE}會議主題：{RESET}", end=" ")
 
@@ -3082,7 +3549,7 @@ def process_audio_file(input_path, mode, translator, model_size="large-v3-turbo"
         return None
 
     basename = os.path.splitext(os.path.basename(input_path))[0]
-    print(f"\n{C_TITLE}{BOLD}▎ 處理: {os.path.basename(input_path)}{RESET}")
+    print(f"\n\n{C_TITLE}{BOLD}▎ 處理: {os.path.basename(input_path)}{RESET}")
     print(f"{C_DIM}{'─' * 60}{RESET}")
 
     # 2. 轉檔
@@ -3595,6 +4062,19 @@ def keypress_listener_thread(stop_event, ctrl_s_event):
             return
 
 
+# ─── 音量波形共用常數 ────────────────────────────────────────
+_BARS = "▁▂▃▄▅▆▇█"
+
+
+def _rms_to_bar(rms):
+    """RMS → 波形字元（對數刻度，增強微弱聲音的可見度）"""
+    if rms < 0.0005:
+        return _BARS[0]
+    db = 20 * math.log10(max(rms, 1e-10))
+    idx = int((db + 60) / 54 * (len(_BARS) - 1))
+    return _BARS[max(0, min(idx, len(_BARS) - 1))]
+
+
 # ─── 底部狀態列（固定顯示快捷鍵提示 + 即時資訊）────────────────
 _status_bar_active = False
 _status_bar_needs_resize = False
@@ -3602,6 +4082,8 @@ _status_bar_state = {
     "start_time": 0.0,   # monotonic 起始時間
     "count": 0,          # 翻譯/轉錄筆數
     "mode": "en2zh",     # 功能模式
+    "rms_history": None,  # deque(maxlen=12)，由 setup_status_bar 初始化
+    "rms_lock": None,     # threading.Lock
 }
 
 
@@ -3611,6 +4093,8 @@ def setup_status_bar(mode="en2zh"):
     _status_bar_state["start_time"] = time.monotonic()
     _status_bar_state["count"] = 0
     _status_bar_state["mode"] = mode
+    _status_bar_state["rms_history"] = deque(maxlen=12)
+    _status_bar_state["rms_lock"] = threading.Lock()
     try:
         cols, rows = os.get_terminal_size()
         _status_bar_state["_last_rows"] = rows
@@ -3623,6 +4107,15 @@ def setup_status_bar(mode="en2zh"):
         sys.stdout.flush()
     except Exception:
         _status_bar_active = False
+
+
+def _push_rms(rms):
+    """Thread-safe 寫入一筆 RMS 值到狀態列波形歷史"""
+    lock = _status_bar_state.get("rms_lock")
+    hist = _status_bar_state.get("rms_history")
+    if lock and hist is not None:
+        with lock:
+            hist.append(rms)
 
 
 def refresh_status_bar():
@@ -3672,11 +4165,25 @@ def _draw_status_bar(rows=None, cols=None):
         time_str = f"{h:02d}:{m:02d}:{s:02d}"
         count = _status_bar_state["count"]
         label = "轉錄" if _status_bar_state["mode"] in ("zh", "en") else "翻譯"
-        status = f" {time_str} | {label} {count} 筆 | Ctrl+C 停止 | Ctrl+S 停止並生成摘要 "
+        # 波形文字（12 字元）
+        wave_str = ""
+        lock = _status_bar_state.get("rms_lock")
+        hist = _status_bar_state.get("rms_history")
+        if lock and hist is not None:
+            with lock:
+                samples = list(hist)
+            if len(samples) < 12:
+                samples = [0.0] * (12 - len(samples)) + samples
+            else:
+                samples = samples[-12:]
+            wave_str = "".join(_rms_to_bar(s) for s in samples)
+        wave_colored = f"\x1b[38;2;80;200;120m{wave_str}\x1b[38;2;200;200;200m" if wave_str else ""
+        status = f" {time_str} {wave_str} | {label} {count} 筆 | Ctrl+C 停止 | Ctrl+S 停止並生成摘要 "
+        status_display = f" {time_str} {wave_colored} | {label} {count} 筆 | Ctrl+C 停止 | Ctrl+S 停止並生成摘要 "
         # 計算顯示寬度（中文字佔 2 格）
         dw = sum(2 if '\u4e00' <= c <= '\u9fff' else 1 for c in status)
         padding = " " * max(0, cols - dw)
-        sys.stdout.write(f"\x1b[48;2;60;60;60m\x1b[38;2;200;200;200m{status}{padding}\x1b[0m")
+        sys.stdout.write(f"\x1b[48;2;60;60;60m\x1b[38;2;200;200;200m{status_display}{padding}\x1b[0m")
         sys.stdout.write("\x1b8")  # 恢復游標位置
         sys.stdout.flush()
     except Exception:
@@ -3703,6 +4210,51 @@ def _handle_sigwinch(signum, frame):
     global _status_bar_needs_resize
     if _status_bar_active:
         _status_bar_needs_resize = True
+
+
+def _start_audio_monitor():
+    """開啟輕量 InputStream 被動監控 BlackHole 音量（Whisper 無錄音時用）。
+    BlackHole 支援多讀取者，不影響 whisper-stream。回傳 stream 物件。"""
+    import sounddevice as sd
+    import numpy as np
+
+    # 找 BlackHole PortAudio device
+    bh_id = None
+    for i, dev in enumerate(sd.query_devices()):
+        if dev["max_input_channels"] > 0 and "blackhole" in dev["name"].lower():
+            bh_id = i
+            break
+    if bh_id is None:
+        return None
+
+    dev_info = sd.query_devices(bh_id)
+    sr = int(dev_info["default_samplerate"])
+    ch = max(dev_info["max_input_channels"], 1)
+
+    def _monitor_cb(indata, frames, time_info, status):
+        _push_rms(float(np.sqrt(np.mean(indata ** 2))))
+
+    try:
+        stream = sd.InputStream(
+            device=bh_id, samplerate=sr, channels=ch,
+            blocksize=int(sr * 0.1), dtype="float32",
+            callback=_monitor_cb,
+        )
+        stream.start()
+        return stream
+    except Exception:
+        return None
+
+
+def _stop_audio_monitor(stream):
+    """停止並關閉被動音量監控 stream"""
+    if stream is None:
+        return
+    try:
+        stream.stop()
+        stream.close()
+    except Exception:
+        pass
 
 
 def parse_args():
@@ -3856,8 +4408,19 @@ def main():
     if args.num_speakers and not args.diarize:
         print(f"{C_HIGHLIGHT}[警告] --num-speakers 需搭配 --diarize 使用，已忽略{RESET}")
 
+    # 互動模式（無 CLI 參數）：第一步選擇輸入來源
+    if (not cli_mode and not args.input and args.summarize is None
+            and not args.list_devices):
+        source, files = _ask_input_source()
+        if source == "file":
+            args.input = files
+
     # --input 離線處理音訊檔
     if args.input:
+        # 純錄音模式不適用於離線處理
+        if args.mode == "record":
+            print("[錯誤] 純錄音模式不適用於離線處理（--input）", file=sys.stderr)
+            sys.exit(1)
         # 決定參數來源：有 --mode → CLI 模式；沒有 → 互動選單
         if args.mode is None:
             (mode, fw_model, ollama_model, summary_model,
@@ -3945,12 +4508,15 @@ def main():
             print(f"  {C_HIGHLIGHT}[警告] LLM 伺服器無法連接，摘要將跳過（逐字稿完成後可用 --summarize 補做）{RESET}")
 
         # 顯示設定資訊
+        print(f"\n\n{C_TITLE}{BOLD}▎ 設定總覽{RESET}")
+        print(f"{C_DIM}{'─' * 60}{RESET}")
         print(f"  {C_WHITE}模式        {mode_label}{RESET}")
         print(f"  {C_WHITE}辨識模型    {fw_model}{RESET}")
         if diarize:
             sp_info = f"啟用（{num_speakers} 人）" if num_speakers else "啟用（自動偵測）"
             print(f"  {C_WHITE}講者辨識    {sp_info}{RESET}")
         print(f"  {C_WHITE}檔案數      {RESET}{C_DIM}{len(args.input)}{RESET}")
+        print(f"{C_DIM}{'─' * 60}{RESET}")
 
         # 逐檔處理
         log_paths = []
@@ -3962,7 +4528,7 @@ def main():
 
         # 如果需要摘要且 LLM 伺服器可用，對產生的 log 檔自動摘要
         if do_summarize and log_paths and can_summarize:
-            print(f"\n{C_TITLE}{BOLD}▎ 自動摘要{RESET}")
+            print(f"\n\n{C_TITLE}{BOLD}▎ 自動摘要{RESET}")
             print(f"{C_DIM}{'─' * 60}{RESET}")
             print(f"  {C_DIM}摘要模型: {summary_model} ({host}:{port}){RESET}")
 
@@ -3997,7 +4563,7 @@ def main():
         host, port = _resolve_ollama_host(args)
         model = args.summary_model
 
-        print(f"\n{C_TITLE}{BOLD}▎ 批次摘要模式{RESET}")
+        print(f"\n\n{C_TITLE}{BOLD}▎ 批次摘要模式{RESET}")
         print(f"{C_DIM}{'─' * 60}{RESET}")
         print(f"  {C_DIM}摘要模型: {model} ({host}:{port}){RESET}")
 
@@ -4139,19 +4705,29 @@ def main():
 
     if args.list_devices:
         if _MOONSHINE_AVAILABLE:
-            print(f"\n{C_TITLE}{BOLD}▎ sounddevice 音訊裝置{RESET}")
+            print(f"\n\n{C_TITLE}{BOLD}▎ sounddevice 音訊裝置{RESET}")
             list_audio_devices_sd()
         # whisper-stream 裝置
         model_path_exists = os.path.isfile(WHISPER_STREAM)
         if model_path_exists:
             _, model_path = resolve_model("large-v3-turbo")
-            print(f"\n{C_TITLE}{BOLD}▎ whisper-stream SDL2 音訊裝置{RESET}")
+            print(f"\n\n{C_TITLE}{BOLD}▎ whisper-stream SDL2 音訊裝置{RESET}")
             list_audio_devices(model_path)
         sys.exit(0)
 
     if cli_mode:
         # CLI 模式：用參數 + 預設值，跳過選單
         mode = args.mode or "en2zh"
+
+        # 純錄音模式：跳過 ASR，直接錄音
+        if mode == "record":
+            rec_id, rec_name, rec_label = _auto_detect_rec_device()
+            if rec_id is None:
+                print("[錯誤] 找不到任何音訊輸入裝置！", file=sys.stderr)
+                sys.exit(1)
+            print(f"{C_OK}錄音裝置: [{rec_id}] {rec_name}（{rec_label}）{RESET}")
+            run_record_only(rec_id)
+            sys.exit(0)
 
         # 決定 ASR 引擎
         if args.asr:
@@ -4259,6 +4835,13 @@ def main():
     else:
         # 互動式選單
         mode = select_mode()
+
+        # 純錄音模式：跳過 ASR/翻譯/模型，選擇錄音來源
+        if mode == "record":
+            rec_id, rec_name, rec_label = _ask_record_source()
+            print(f"  {C_OK}錄音裝置: [{rec_id}] {rec_name}（{rec_label}）{RESET}")
+            run_record_only(rec_id)
+            sys.exit(0)
 
         # 英文模式：選擇 ASR 引擎
         if mode in ("en2zh", "en"):
