@@ -67,7 +67,7 @@ Author: Jason Cheng (Jason Tools)
 
 ![講者辨識：終端機逐字稿輸出](images/offline-diarize-result-2.png)
 
-### 4. AI 會議摘要
+### 4. AI 會議摘要與時間軸逐字稿
 批次對記錄檔生成摘要，透過本地端 LLM 產出重點整理 + 校正逐字稿。搭配講者辨識，摘要中不同講者以不同顏色區分。
 
 ![AI 會議摘要產出畫面](images/summary-output.png)
