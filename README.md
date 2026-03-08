@@ -74,12 +74,12 @@ Author: Jason Cheng (Jason Tools)
 
 ![匯入錄音檔產生的摘要與校正逐字稿](images/offline-summary-diarize.png)
 
-![時間逐字稿 HTML](images/offline-transcript.png)
-
 時間逐字稿 HTML 內嵌音訊播放器與波形圖，可直接點選波形任意位置跳至該時間點；播放時對應的逐字稿段落會即時以高亮區塊標示，方便對照聆聽。
 
+![時間逐字稿 HTML](images/offline-transcript.png)
+
 ### 5. 多模式語音轉錄
-4 種功能模式：英翻中 / 中翻英 / 純英文轉錄 / 純中文轉錄，滿足各種使用場景。
+5 種功能模式：英翻中 / 中翻英 / 純英文轉錄 / 純中文轉錄 / 純錄音，滿足各種使用場景。
 
 ## 其他特色
 
