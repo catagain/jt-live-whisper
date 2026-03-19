@@ -97,7 +97,7 @@ $banner_line = '=' * $cols
 
 Write-Host ""
 Write-Host "${C_TITLE}${banner_line}${NC}"
-Write-Host "${C_TITLE}${BOLD}  jt-live-whisper v2.12.0 - 100% 全地端 AI 語音工具集${NC}"
+Write-Host "${C_TITLE}${BOLD}  jt-live-whisper v2.14.0 - 100% 全地端 AI 語音工具集${NC}"
 Write-Host "${C_TITLE}  by Jason Cheng (Jason Tools)${NC}"
 Write-Host "${C_TITLE}${banner_line}${NC}"
 Write-Host ""
@@ -204,5 +204,11 @@ if (-not (Test-Path $MAIN_PY)) {
     exit 1
 }
 
-& $VENV_PYTHON $MAIN_PY @args
+# --webui 模式：啟動 WebUI 伺服器（設定與字幕都在瀏覽器操作）
+$WEBUI_PY = Join-Path $SCRIPT_DIR "webui.py"
+if ($args -contains "--webui") {
+    & $VENV_PYTHON $WEBUI_PY
+} else {
+    & $VENV_PYTHON $MAIN_PY @args
+}
 exit $LASTEXITCODE

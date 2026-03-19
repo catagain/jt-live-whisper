@@ -301,7 +301,7 @@ $banner_line = '=' * $cols
 
 Write-Host ""
 Write-Host "${C_TITLE}${banner_line}${NC}"
-Write-Host "${C_TITLE}${BOLD}  jt-live-whisper v2.12.0 - 100% 全地端 AI 語音工具集 - Windows 安裝程式${NC}"
+Write-Host "${C_TITLE}${BOLD}  jt-live-whisper v2.14.0 - 100% 全地端 AI 語音工具集 - Windows 安裝程式${NC}"
 Write-Host "${C_TITLE}  by Jason Cheng (Jason Tools)${NC}"
 Write-Host "${C_TITLE}${banner_line}${NC}"
 Write-Host ""
@@ -374,7 +374,7 @@ if ($Upgrade) {
     $archiveDir = Join-Path $SCRIPT_DIR "versions\v${localVer}"
     if (-not (Test-Path $archiveDir)) {
         New-Item -Path $archiveDir -ItemType Directory -Force | Out-Null
-        foreach ($f in @("translate_meeting.py","start.sh","start.ps1","install.sh","install.ps1","SOP.md","config.json")) {
+        foreach ($f in @("translate_meeting.py","start.sh","start.ps1","install.sh","install.ps1","SOP.md","config.json","webui.py","webui.html")) {
             $src = Join-Path $SCRIPT_DIR $f
             if (Test-Path $src) { Copy-Item $src $archiveDir }
         }
@@ -383,7 +383,7 @@ if ($Upgrade) {
 
     # 更新檔案
     $updated = 0
-    foreach ($f in @("translate_meeting.py","start.sh","start.ps1","install.sh","install.ps1","SOP.md")) {
+    foreach ($f in @("translate_meeting.py","start.sh","start.ps1","install.sh","install.ps1","SOP.md","webui.py","webui.html")) {
         $src = Join-Path $repoDir $f
         if (Test-Path $src) {
             Copy-Item $src (Join-Path $SCRIPT_DIR $f) -Force
@@ -757,6 +757,9 @@ $corePackages = @(
     @("spectralcluster",                 "spectralcluster（講者辨識 - 分群）"),
     @("sounddevice",                     "sounddevice（音訊擷取）"),
     @("noisereduce",                     "noisereduce（背景降噪）"),
+    @("fastapi",                         "fastapi（WebUI 伺服器）"),
+    @("uvicorn",                         "uvicorn（WebUI ASGI 伺服器）"),
+    @("websockets",                      "websockets（WebUI 即時通訊）"),
     @("argostranslate",                  "Argos Translate（離線翻譯備援）")
 )
 
@@ -1186,16 +1189,23 @@ if ($true) {
                 } else {
                     $dlModel = Read-Host "  下載 Whisper 模型 $($m.Name) ($($m.Size))？(Y/n)"
                     if ($dlModel -ne 'n' -and $dlModel -ne 'N') {
-                        info "下載中（$($m.Size)），請稍候..."
+                        info "下載中（$($m.Size)）..."
                         try {
-                            [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
-                            $oldProg = $ProgressPreference
-                            $ProgressPreference = 'SilentlyContinue'
-                            Invoke-WebRequest -Uri $m.Url -OutFile $mPath -UseBasicParsing -ErrorAction Stop
-                            $ProgressPreference = $oldProg
+                            # 優先用 curl.exe（Windows 10+ 內建，有進度條）
+                            $curlExe = Get-Command curl.exe -ErrorAction SilentlyContinue
+                            if ($curlExe) {
+                                & curl.exe -L --progress-bar -o $mPath $m.Url
+                                if ($LASTEXITCODE -ne 0) { throw "curl 下載失敗 (exit code $LASTEXITCODE)" }
+                            } else {
+                                # Fallback: Invoke-WebRequest（無進度條但可靠）
+                                [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
+                                $oldProg = $ProgressPreference
+                                $ProgressPreference = 'SilentlyContinue'
+                                Invoke-WebRequest -Uri $m.Url -OutFile $mPath -UseBasicParsing -ErrorAction Stop
+                                $ProgressPreference = $oldProg
+                            }
                             check_ok "Whisper 模型 $($m.Name)"
                         } catch {
-                            $ProgressPreference = $oldProg
                             check_fail "模型下載失敗：$($_.Exception.Message)"
                             info "可稍後手動下載: $($m.Url)"
                         }
@@ -1243,7 +1253,8 @@ if ($fwModelFound -eq "found") {
 } else {
     info "下載 faster-whisper large-v3-turbo 模型（約 1.6GB）..."
     & $VENV_PYTHON -m pip install --disable-pip-version-check -q huggingface_hub 2>$null | Out-Null
-    $null = hf_download "Systran/faster-whisper-large-v3-turbo" "faster-whisper 模型" ""
+    # mobiuslabsgmbh 是 faster-whisper 內部預設的 repo（Systran 已需認證）
+    $null = hf_download "mobiuslabsgmbh/faster-whisper-large-v3-turbo" "faster-whisper 模型" ""
 
     # 驗證下載
     $fwVerify = & $VENV_PYTHON -c @"

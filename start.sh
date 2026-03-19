@@ -20,7 +20,7 @@ _COLS=$(tput cols 2>/dev/null || echo 60)
 [ "$_COLS" -lt 40 ] && _COLS=40
 _LINE=$(printf '%*s' "$_COLS" '' | tr ' ' '=')
 echo -e "${C_TITLE}${_LINE}${NC}"
-echo -e "${C_TITLE}${BOLD}  jt-live-whisper v2.12.0 - 100% 全地端 AI 語音工具集${NC}"
+echo -e "${C_TITLE}${BOLD}  jt-live-whisper v2.14.0 - 100% 全地端 AI 語音工具集${NC}"
 echo -e "${C_TITLE}  by Jason Cheng (Jason Tools)${NC}"
 echo -e "${C_TITLE}${_LINE}${NC}"
 echo ""
@@ -128,7 +128,15 @@ fi
 
 echo ""
 
-python3 "$SCRIPT_DIR/translate_meeting.py" "$@"
+# --webui 模式：啟動 WebUI 伺服器（設定與字幕都在瀏覽器操作）
+_is_webui=0
+for _arg in "$@"; do [ "$_arg" = "--webui" ] && _is_webui=1 && break; done
+
+if [ $_is_webui -eq 1 ]; then
+    python3 "$SCRIPT_DIR/webui.py"
+else
+    python3 "$SCRIPT_DIR/translate_meeting.py" "$@"
+fi
 
 # 安全網：確保終端機恢復正常（防止 Ctrl+S raw mode 殘留）
 stty sane 2>/dev/null

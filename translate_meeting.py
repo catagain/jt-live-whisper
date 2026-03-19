@@ -104,7 +104,7 @@ import urllib.request
 import ctranslate2
 import sentencepiece
 
-# OpenCC 簡體→台灣繁體轉換（Argos 翻譯必須；LLM 翻譯由 prompt 控制也會經過）
+# OpenCC 簡體→台灣繁體轉換（用於 ASR 辨識結果；LLM 翻譯結果由 prompt 控制，不經 S2TWP）
 try:
     from opencc import OpenCC as _OpenCC
     S2TWP = _OpenCC("s2twp")
@@ -696,6 +696,7 @@ def _whisper_model_fit_label(model_name, recommended, has_remote=False):
 SCENE_PRESETS = [
     ("線上會議", 5000, 3000, "對話短句，反應快（5秒）"),
     ("教育訓練", 8000, 3000, "長句連續講述，翻譯更完整（8秒）"),
+    ("演講簡報", 12000, 4000, "長段演講，內容完整度優先（12秒）"),
     ("快速字幕", 3000, 2000, "最低延遲，適合即時展示（3秒）"),
 ]
 
@@ -712,7 +713,94 @@ ASR_ENGINES = [
     ("moonshine", "Moonshine", "真串流，低延遲，僅英文"),
 ]
 
-APP_VERSION = "2.12.0"
+APP_VERSION = "2.14.0"
+
+# ─── WebUI 暫停控制（SIGUSR1 toggle）──────────────────────────────
+_webui_pause_event = None  # 由各 streaming 函式設定
+
+
+def _handle_sigusr1(signum, frame):
+    """SIGUSR1：WebUI 暫停/繼續 toggle"""
+    if _webui_pause_event is not None:
+        if _webui_pause_event.is_set():
+            _webui_pause_event.clear()
+        else:
+            _webui_pause_event.set()
+
+
+if not IS_WINDOWS and hasattr(signal, "SIGUSR1"):
+    signal.signal(signal.SIGUSR1, _handle_sigusr1)
+
+# ─── WebUI Event System ──────────────────────────────────────────
+# --webui 啟動時透過 TCP socket 將事件推送到 webui.py
+# 不啟用時 _webui_send() 是 no-op，零效能影響
+_webui_queue = None  # queue.Queue，啟用時才建立
+_WEBUI_PORT = 19780
+
+
+def _webui_send(event: dict):
+    """非阻塞推送事件到 WebUI（未啟用時直接返回）"""
+    if _webui_queue is not None:
+        try:
+            _webui_queue.put_nowait(event)
+        except Exception:
+            pass
+
+
+def _start_webui_sender():
+    """啟動 WebUI TCP sender daemon thread"""
+    global _webui_queue
+    import queue as _q
+    _webui_queue = _q.Queue(maxsize=500)
+
+    def _sender():
+        import socket as _sock
+        import json as _json
+        conn = None
+
+        def _connect():
+            """嘗試 TCP 連線到 webui.py"""
+            nonlocal conn
+            if conn is not None:
+                return True
+            for _ in range(3):  # 重試 3 次
+                try:
+                    s = _sock.socket(_sock.AF_INET, _sock.SOCK_STREAM)
+                    s.settimeout(1.0)
+                    s.connect(("127.0.0.1", _WEBUI_PORT))
+                    s.settimeout(None)
+                    conn = s
+                    return True
+                except Exception:
+                    time.sleep(0.5)
+            return False
+
+        # 預先連線（不等第一個事件）
+        time.sleep(1.0)  # 等 webui.py 啟動
+        _connect()
+
+        while True:
+            try:
+                ev = _webui_queue.get(timeout=5.0)
+            except Exception:
+                # 沒有事件也定期嘗試重連
+                if conn is None:
+                    _connect()
+                continue
+            if not _connect():
+                continue  # 連不上就丟棄此事件
+            try:
+                conn.sendall((_json.dumps(ev, ensure_ascii=False) + "\n").encode("utf-8"))
+            except Exception:
+                try:
+                    conn.close()
+                except Exception:
+                    pass
+                conn = None
+
+    _t = threading.Thread(target=_sender, daemon=True)
+    _t.start()
+
 
 # 常見 LLM 伺服器預設 port（供參考）
 LLM_PRESETS = [
@@ -898,7 +986,7 @@ TRANSCRIPT_CORRECT_PROMPT_TEMPLATE = """\
 """
 
 # 場景名稱對照（CLI 用）
-SCENE_MAP = {"meeting": 0, "training": 1, "subtitle": 2}
+SCENE_MAP = {"meeting": 0, "training": 1, "presentation": 2, "subtitle": 3}
 MODE_MAP = {key: i for i, (key, _, _) in enumerate(MODE_PRESETS)}
 APP_NAME = f"jt-live-whisper v{APP_VERSION} - 100% 全地端 AI 語音工具集"
 APP_AUTHOR = "by Jason Cheng (Jason Tools)"
@@ -1672,10 +1760,22 @@ class OllamaTranslator:
             result = re.sub(r'<think>[\s\S]*?</think>', '', result).strip()
             # 移除未閉合的 <think>（模型可能只輸出開頭）
             result = re.sub(r'<think>[\s\S]*', '', result).strip()
+            # 移除 prompt 洩漏（模型把 instruction 輸出到翻譯結果中）
+            result = re.sub(r'[/\|]?\s*Instruction:.*$', '', result, flags=re.IGNORECASE).strip()
+            result = re.sub(r'忠實翻譯原文.*$', '', result).strip()
+            result = re.sub(r'禁止因政治.*$', '', result).strip()
+            # 過濾 LLM 自我修正/思考洩漏
+            result = re.sub(r'根據格式要求.*$', '', result).strip()
+            result = re.sub(r'最終版本[：:].*$', '', result).strip()
+            result = re.sub(r'最終定稿[：:].*$', '', result).strip()
+            result = re.sub(r'再確認指令後.*$', '', result).strip()
+            result = re.sub(r'再依指示修正後.*$', '', result).strip()
+            result = re.sub(r'直接翻譯[為为].*$', '', result).strip()
+            result = re.sub(r'注意[「「].*如果要更.*$', '', result).strip()
+            result = re.sub(r'但遵守指令.*$', '', result).strip()
             # 只取第一行，避免 model 輸出多餘解釋
             result = result.split("\n")[0].strip()
-            if self.direction in ("en2zh", "ja2zh"):
-                result = S2TWP.convert(result)
+            # LLM 翻譯不經 S2TWP（prompt 已控制繁體，S2TWP 會誤轉如「干擾→幹擾」）
             # 過濾翻譯幻覺（模型輸出評論而非翻譯）
             if self._is_hallucinated(text, result):
                 # 先嘗試去除括號評論
@@ -1688,8 +1788,6 @@ class OllamaTranslator:
                     result = re.sub(r'<think>[\s\S]*?</think>', '', result).strip()
                     result = re.sub(r'<think>[\s\S]*', '', result).strip()
                     result = result.split("\n")[0].strip()
-                    if self.direction in ("en2zh", "ja2zh"):
-                        result = S2TWP.convert(result)
                     if self._is_hallucinated(text, result):
                         result = self._strip_commentary(result)
                         if not result:
@@ -3644,6 +3742,7 @@ def run_stream(capture_id: int, translator, model_name: str, model_path: str,
 
     stop_keypress = threading.Event()
     pause_event = threading.Event()
+    global _webui_pause_event; _webui_pause_event = pause_event
     setup_terminal_raw_input()
     kp_thread = threading.Thread(
         target=keypress_listener_thread,
@@ -3735,6 +3834,7 @@ def run_stream(capture_id: int, translator, model_name: str, model_path: str,
         "ja": "說日文即可看到字幕",
     }
     print(f"{C_OK}{BOLD}開始監聽...{RESET} {C_WHITE}{listen_hints.get(mode, '')}{RESET}\n\n", flush=True)
+    _webui_send({"type": "started", "mode": mode})
 
     # 設定底部固定狀態列（快捷鍵提示 + 即時資訊）
     _tr_model = translator.model if isinstance(translator, OllamaTranslator) else ("NLLB" if isinstance(translator, NllbTranslator) else ("Argos" if isinstance(translator, ArgosTranslator) else ""))
@@ -3782,6 +3882,12 @@ def run_stream(capture_id: int, translator, model_name: str, model_path: str,
             with open(log_path, "a", encoding="utf-8") as log_f:
                 log_f.write(f"[{timestamp}] [{src_label}] {src_text}\n")
                 log_f.write(f"[{timestamp}] [{dst_label}] {result}\n\n")
+            _webui_send({"type": "transcription", "source": "main",
+                         "src_lang": src_label, "src_text": src_text,
+                         "dst_lang": dst_label, "dst_text": result,
+                         "asr_time": round(asr_elapsed, 1),
+                         "translate_time": round(elapsed, 1),
+                         "timestamp": timestamp})
 
     def translate_and_print(seq, src_text, log_path, asr_elapsed=0):
         """背景執行緒：翻譯並按序號排隊輸出"""
@@ -3789,7 +3895,7 @@ def run_stream(capture_id: int, translator, model_name: str, model_path: str,
         result = translator.translate(src_text)
         elapsed = time.monotonic() - t0
         if result:
-            result = S2TWP.convert(result)
+            if not isinstance(translator, OllamaTranslator): result = S2TWP.convert(result)
         with _trans_lock:
             _trans_pending[seq] = (src_text, result, elapsed, asr_elapsed)
         _drain_translations(log_path)
@@ -4051,6 +4157,7 @@ def run_stream_moonshine(capture_id: int, translator, moonshine_model_name: str,
 
     stop_event = threading.Event()
     pause_event = threading.Event()
+    global _webui_pause_event; _webui_pause_event = pause_event
     setup_terminal_raw_input()
     kp_thread = threading.Thread(
         target=keypress_listener_thread,
@@ -4094,6 +4201,12 @@ def run_stream_moonshine(capture_id: int, translator, moonshine_model_name: str,
             with open(log_path, "a", encoding="utf-8") as log_f:
                 log_f.write(f"[{timestamp}] [{src_label}] {src_text}\n")
                 log_f.write(f"[{timestamp}] [{dst_label}] {result}\n\n")
+            _webui_send({"type": "transcription", "source": "main",
+                         "src_lang": src_label, "src_text": src_text,
+                         "dst_lang": dst_label, "dst_text": result,
+                         "asr_time": round(asr_elapsed, 1),
+                         "translate_time": round(elapsed, 1),
+                         "timestamp": timestamp})
 
     def translate_and_print(seq, src_text, log_path, asr_elapsed=0):
         """背景執行緒：翻譯並按序號排隊輸出"""
@@ -4101,7 +4214,7 @@ def run_stream_moonshine(capture_id: int, translator, moonshine_model_name: str,
         result = translator.translate(src_text)
         elapsed = time.monotonic() - t0
         if result:
-            result = S2TWP.convert(result)
+            if not isinstance(translator, OllamaTranslator): result = S2TWP.convert(result)
         with _trans_lock:
             _trans_pending[seq] = (src_text, result, elapsed, asr_elapsed)
         _drain_translations(log_path)
@@ -4389,6 +4502,7 @@ def run_stream_moonshine(capture_id: int, translator, moonshine_model_name: str,
         "en": "說英文即可看到字幕",
     }
     print(f"{C_OK}{BOLD}開始監聽...{RESET} {C_WHITE}{listen_hints.get(mode, '')}{RESET}\n\n", flush=True)
+    _webui_send({"type": "started", "mode": mode})
 
     # 設定狀態列
     _tr_model = translator.model if isinstance(translator, OllamaTranslator) else ("NLLB" if isinstance(translator, NllbTranslator) else ("Argos" if isinstance(translator, ArgosTranslator) else ""))
@@ -4590,6 +4704,7 @@ def run_stream_remote(capture_id: int, translator, model_name: str,
     ring_lock = threading.Lock()
 
     pause_event = threading.Event()
+    global _webui_pause_event; _webui_pause_event = pause_event
     print_lock = threading.Lock()
     setup_terminal_raw_input()
     kp_thread = threading.Thread(
@@ -4710,6 +4825,12 @@ def run_stream_remote(capture_id: int, translator, model_name: str,
             with open(_log_path, "a", encoding="utf-8") as log_f:
                 log_f.write(f"[{timestamp}] [{src_label}] {src_text}\n")
                 log_f.write(f"[{timestamp}] [{dst_label}] {result}\n\n")
+            _webui_send({"type": "transcription", "source": "main",
+                         "src_lang": src_label, "src_text": src_text,
+                         "dst_lang": dst_label, "dst_text": result,
+                         "asr_time": round(asr_elapsed, 1),
+                         "translate_time": round(elapsed, 1),
+                         "timestamp": timestamp})
 
     def translate_and_print(seq, src_text, _log_path, asr_elapsed=0):
         """背景執行緒：翻譯並按序號排隊輸出"""
@@ -4717,7 +4838,7 @@ def run_stream_remote(capture_id: int, translator, model_name: str,
         result = translator.translate(src_text)
         elapsed = time.monotonic() - t0
         if result:
-            result = S2TWP.convert(result)
+            if not isinstance(translator, OllamaTranslator): result = S2TWP.convert(result)
         with _trans_lock:
             _trans_pending[seq] = (src_text, result, elapsed, asr_elapsed)
         _drain_translations(_log_path)
@@ -4818,6 +4939,9 @@ def run_stream_remote(capture_id: int, translator, model_name: str,
                     timestamp = time.strftime("%H:%M:%S")
                     with open(log_path, "a", encoding="utf-8") as log_f:
                         log_f.write(f"[{timestamp}] [{src_label}] {line}\n\n")
+                    _webui_send({"type": "transcription", "source": "main",
+                                 "src_lang": src_label, "src_text": line,
+                                 "asr_time": round(proc_time, 1), "timestamp": timestamp})
 
     # ── 清理 ──
     _cleaned_up = [False]
@@ -4885,6 +5009,7 @@ def run_stream_remote(capture_id: int, translator, model_name: str,
         "ja": "說日文即可看到字幕",
     }
     print(f"{C_OK}{BOLD}開始監聽...{RESET} {C_WHITE}{listen_hints.get(mode, '')}{RESET}\n\n", flush=True)
+    _webui_send({"type": "started", "mode": mode})
 
     _tr_model = translator.model if isinstance(translator, OllamaTranslator) else ("NLLB" if isinstance(translator, NllbTranslator) else ("Argos" if isinstance(translator, ArgosTranslator) else ""))
     _tr_loc = "伺服器" if isinstance(translator, OllamaTranslator) else ("本機" if isinstance(translator, (ArgosTranslator, NllbTranslator)) else "")
@@ -5144,6 +5269,7 @@ def run_stream_local_whisper(capture_id: int, translator, model_name: str,
     ring_lock = threading.Lock()
 
     pause_event = threading.Event()
+    global _webui_pause_event; _webui_pause_event = pause_event
     print_lock = threading.Lock()
     setup_terminal_raw_input()
     kp_thread = threading.Thread(
@@ -5276,13 +5402,19 @@ def run_stream_local_whisper(capture_id: int, translator, model_name: str,
             with open(_log_path, "a", encoding="utf-8") as log_f:
                 log_f.write(f"[{timestamp}] [{src_label}] {src_text}\n")
                 log_f.write(f"[{timestamp}] [{dst_label}] {result}\n\n")
+            _webui_send({"type": "transcription", "source": "main",
+                         "src_lang": src_label, "src_text": src_text,
+                         "dst_lang": dst_label, "dst_text": result,
+                         "asr_time": round(asr_elapsed, 1),
+                         "translate_time": round(elapsed, 1),
+                         "timestamp": timestamp})
 
     def translate_and_print(seq, src_text, _log_path, asr_elapsed=0):
         t0 = time.monotonic()
         result = translator.translate(src_text)
         elapsed = time.monotonic() - t0
         if result:
-            result = S2TWP.convert(result)
+            if not isinstance(translator, OllamaTranslator): result = S2TWP.convert(result)
         with _trans_lock:
             _trans_pending[seq] = (src_text, result, elapsed, asr_elapsed)
         _drain_translations(_log_path)
@@ -5395,6 +5527,9 @@ def run_stream_local_whisper(capture_id: int, translator, model_name: str,
                     timestamp = time.strftime("%H:%M:%S")
                     with open(log_path, "a", encoding="utf-8") as log_f:
                         log_f.write(f"[{timestamp}] [{src_label}] {line}\n\n")
+                    _webui_send({"type": "transcription", "source": "main",
+                                 "src_lang": src_label, "src_text": line,
+                                 "asr_time": round(proc_time, 1), "timestamp": timestamp})
 
     # ── 清理 ──
     _cleaned_up = [False]
@@ -5476,6 +5611,7 @@ def run_stream_local_whisper(capture_id: int, translator, model_name: str,
         "ja": "說日文即可看到字幕",
     }
     print(f"\n{C_OK}{BOLD}開始監聽...{RESET} {C_WHITE}{listen_hints.get(mode, '')}{RESET}\n\n", flush=True)
+    _webui_send({"type": "started", "mode": mode})
 
     _tr_model = translator.model if isinstance(translator, OllamaTranslator) else ("NLLB" if isinstance(translator, NllbTranslator) else ("Argos" if isinstance(translator, ArgosTranslator) else ""))
     _tr_loc = "伺服器" if isinstance(translator, OllamaTranslator) else ("本機" if isinstance(translator, (ArgosTranslator, NllbTranslator)) else "")
@@ -5574,9 +5710,11 @@ def run_stream_bidirectional(lb_device_id, mic_device_id,
     mic_lang = _MIC_LANG[mode]
     lb_hallu = _LB_HALLU[mode]
     mic_hallu = _MIC_HALLU[mode]
-    # en_zh 雙向：麥克風用語言預偵測（detect_language → 正確語言辨識），英文結果跳過翻譯
-    _mic_skip_english = (mode == "en_zh")
-    if _mic_skip_english:
+    # 雙向模式麥克風語言預偵測（detect_language → 正確語言辨識）
+    # en_zh: 中文翻譯、英文直接顯示；ja_zh: 中文翻譯、日文/英文直接顯示
+    _mic_auto_detect = (mode in ("en_zh", "ja_zh"))
+    _mic_skip_langs = {"en_zh": {"en"}, "ja_zh": {"ja", "en"}}.get(mode)  # 偵測到這些語言時跳過翻譯
+    if _mic_auto_detect:
         mic_lang = None  # 觸發 local_transcribe 內的語言預偵測
 
     # ── 翻譯記錄檔 ──
@@ -5663,9 +5801,12 @@ def run_stream_bidirectional(lb_device_id, mic_device_id,
             # 用 lb_lang 預熱；若 mic_lang 不同則再預熱一次（避免首次辨識觸發 MLX 重編譯）
             _call_with_ssl_retry(_mlx_whisper_mod.transcribe, _warmup_path, path_or_hf_repo=_mlx_repo, language=lb_lang)
             if mic_lang is None:
-                # 自動偵測模式：預熱 transcribe（中/英兩種語言）
-                _warmup_other = "zh" if lb_lang != "zh" else "en"
-                _mlx_whisper_mod.transcribe(_warmup_path, path_or_hf_repo=_mlx_repo, language=_warmup_other)
+                # 自動偵測模式：預熱 transcribe（偵測可能用到的語言）
+                _warmup_langs = {"zh", "en"}
+                if mode == "ja_zh":
+                    _warmup_langs.add("ja")
+                for _wl in _warmup_langs - {lb_lang}:
+                    _mlx_whisper_mod.transcribe(_warmup_path, path_or_hf_repo=_mlx_repo, language=_wl)
                 # 預熱 detect_language + direct_decode 路徑（避免首次辨識觸發 MLX JIT 編譯）
                 import mlx.core as _warmup_mx
                 from mlx_whisper.transcribe import ModelHolder as _WarmupMH
@@ -5689,14 +5830,15 @@ def run_stream_bidirectional(lb_device_id, mic_device_id,
                     _w_model.decode(_w_mel_seg, _w_opts)
                 except Exception:
                     pass
-                # 也預熱英文 decode（避免首次切換到英文時 JIT 重編譯）
-                _w_opts_en = _WarmupDO(language="en", task="transcribe", temperature=0.0,
-                    sample_len=25, fp16=True)
-                try:
-                    _w_model.decode(_w_mel_seg, _w_opts_en)
-                except Exception:
-                    pass
-                del _w_model, _w_mel, _w_mel_seg, _w_tok, _w_opts, _w_opts_en
+                # 也預熱英文（+ ja_zh 模式的日文）decode
+                for _wl2 in ({"en", "ja"} if mode == "ja_zh" else {"en"}):
+                    _w_opts2 = _WarmupDO(language=_wl2, task="transcribe", temperature=0.0,
+                        sample_len=25, fp16=True)
+                    try:
+                        _w_model.decode(_w_mel_seg, _w_opts2)
+                    except Exception:
+                        pass
+                del _w_model, _w_mel, _w_mel_seg, _w_tok, _w_opts
             elif mic_lang != lb_lang:
                 _mlx_whisper_mod.transcribe(_warmup_path, path_or_hf_repo=_mlx_repo, language=mic_lang)
         _hf_logger.setLevel(_hf_log_level)
@@ -5846,8 +5988,9 @@ def run_stream_bidirectional(lb_device_id, mic_device_id,
     if not mic_translate:
         print(f"  {C_HIGHLIGHT}  {_hint_n}. ASR 雙路辨識（非 whisper-stream），辨識負載加倍{RESET}")
         _hint_n += 1
-    if _mic_skip_english:
-        print(f"  {C_OK}  {_hint_n}. 麥克風支援中英混雜，開始幾句辨識較慢屬正常（模型預熱中）{RESET}")
+    if _mic_auto_detect:
+        _mix_hint = "中日英混雜" if mode == "ja_zh" else "中英混雜"
+        print(f"  {C_OK}  {_hint_n}. 麥克風支援{_mix_hint}，開始幾句辨識較慢屬正常（模型預熱中）{RESET}")
     print(f"  {C_DIM}按 Ctrl+P 暫停/繼續 ─ Ctrl+C 停止{RESET}")
     print(f"{C_TITLE}{'=' * 60}{RESET}")
     print()
@@ -5866,6 +6009,7 @@ def run_stream_bidirectional(lb_device_id, mic_device_id,
     mic_ring_lock = threading.Lock()
 
     pause_event = threading.Event()
+    global _webui_pause_event; _webui_pause_event = pause_event
     print_lock = threading.Lock()
     setup_terminal_raw_input()
     kp_thread = threading.Thread(
@@ -5877,10 +6021,16 @@ def run_stream_bidirectional(lb_device_id, mic_device_id,
     kp_thread.start()
 
     # ── Loopback 音訊 callback ──
+    # WebUI 靜音 flag 檔案
+    _mute_lb_flag = os.path.join(os.path.dirname(os.path.abspath(__file__)), ".mute_lb")
+    _mute_mic_flag = os.path.join(os.path.dirname(os.path.abspath(__file__)), ".mute_mic")
+
     def lb_audio_callback(indata, frames, time_info, status):
         nonlocal lb_ring_write_pos, lb_ring_filled
         if stop_event.is_set():
             return
+        if os.path.isfile(_mute_lb_flag):
+            return  # 系統音訊已靜音
         audio = indata.astype(np.float32)
         if audio.ndim > 1 and audio.shape[1] > 1:
             audio = audio.mean(axis=1)
@@ -5905,6 +6055,8 @@ def run_stream_bidirectional(lb_device_id, mic_device_id,
         nonlocal mic_ring_write_pos, mic_ring_filled
         if stop_event.is_set():
             return
+        if os.path.isfile(_mute_mic_flag):
+            return  # 麥克風已靜音
         audio = indata.astype(np.float32)
         if audio.ndim > 1 and audio.shape[1] > 1:
             audio = audio.mean(axis=1)
@@ -6024,7 +6176,7 @@ def run_stream_bidirectional(lb_device_id, mic_device_id,
 
     if use_mlx:
         # 預載語言偵測所需模組（en_zh 麥克風自動偵測中/英）
-        if _mic_skip_english:
+        if _mic_auto_detect:
             import mlx.core as _mx
             from math import gcd as _gcd
             from scipy.signal import resample_poly as _resample_poly
@@ -6084,11 +6236,17 @@ def run_stream_bidirectional(lb_device_id, mic_device_id,
                 _mel_seg = _mlx_audio_mod.pad_or_trim(
                     _mel, _mlx_audio_mod.N_FRAMES, axis=-2
                 ).astype(_mx.float16)
-                # 語言偵測
+                # 語言偵測：偏向中文（主要語言），zh > 30% 就用中文
                 _, _probs = _model.detect_language(_mel_seg)
                 _zh_prob = _probs.get("zh", 0)
-                # 偏向中文（主要語言）：zh_prob > 30% 就用中文，避免短句被誤判為英文
-                lang = "zh" if _zh_prob > 0.3 else "en"
+                if _zh_prob > 0.3:
+                    lang = "zh"
+                elif mode == "ja_zh":
+                    # ja_zh 模式：非中文時區分日文和英文
+                    _ja_prob = _probs.get("ja", 0)
+                    lang = "ja" if _ja_prob > _probs.get("en", 0) else "en"
+                else:
+                    lang = "en"
                 # 直接 decode（省掉 transcribe 的 mel 重算 + ffmpeg）
                 # sample_len=25：8 秒音訊約 15-20 token，25 足夠且限制誤判時的最壞延遲
                 _prompt = _WHISPER_PROMPT.get(lang)
@@ -6133,7 +6291,7 @@ def run_stream_bidirectional(lb_device_id, mic_device_id,
                 return [], "", proc_time, detected_lang
             # 非 detect 路徑：走原本的 transcribe() API
             # bidi 模式用較小的 sample_len（35）加速，減少序列化鎖佔用時間
-            _sl = 35 if _mic_skip_english else 50
+            _sl = 35 if _mic_auto_detect else 50
             _kw = dict(
                 path_or_hf_repo=_mlx_repo,
                 language=lang,
@@ -6162,7 +6320,7 @@ def run_stream_bidirectional(lb_device_id, mic_device_id,
             return segments, full_text, proc_time, detected_lang
     else:
         # Windows: 預載 resample 工具（en_zh mic 語言預偵測用）
-        if _mic_skip_english:
+        if _mic_auto_detect:
             from math import gcd as _gcd_fw
             from scipy.signal import resample_poly as _resample_poly_fw
             _WHISPER_SR_FW = 16000
@@ -6189,10 +6347,16 @@ def run_stream_bidirectional(lb_device_id, mic_device_id,
                 _audio_np = _load_wav_as_np(wav_path)
                 _audio_input = _audio_np  # 傳 numpy array 給 transcribe，省掉第二次 ffmpeg
                 _det, _det_prob, _all_probs = fw_model.detect_language(_audio_np)
-                # 偏向中文（主要語言）：zh > 30% 就用中文（與 macOS 邏輯一致）
+                # 偏向中文（主要語言）：zh > 30% 就用中文
                 _prob_dict = dict(_all_probs)
                 _zh_prob_fw = _prob_dict.get("zh", 0)
-                lang = "zh" if _zh_prob_fw > 0.3 else "en"
+                if _zh_prob_fw > 0.3:
+                    lang = "zh"
+                elif mode == "ja_zh":
+                    _ja_prob_fw = _prob_dict.get("ja", 0)
+                    lang = "ja" if _ja_prob_fw > _prob_dict.get("en", 0) else "en"
+                else:
+                    lang = "en"
             _kw = dict(
                 language=lang, beam_size=1, best_of=1,
                 temperature=0, condition_on_previous_text=False,
@@ -6270,6 +6434,9 @@ def run_stream_bidirectional(lb_device_id, mic_device_id,
                 _log_prefix = "◀ " if source == "loopback" else "▶ "
                 with open(log_path, "a", encoding="utf-8") as log_f:
                     log_f.write(f"[{timestamp}] {_log_prefix}[{src_label}] {src_text}\n\n")
+                _webui_send({"type": "transcription", "source": source,
+                             "src_lang": src_label, "src_text": src_text,
+                             "asr_time": round(asr_elapsed, 1), "timestamp": timestamp})
                 continue
             if not result:
                 continue
@@ -6288,6 +6455,12 @@ def run_stream_bidirectional(lb_device_id, mic_device_id,
             with open(log_path, "a", encoding="utf-8") as log_f:
                 log_f.write(f"[{timestamp}] {_log_prefix}[{src_label}] {src_text}\n")
                 log_f.write(f"[{timestamp}] {_log_prefix}[{dst_label}] {result}\n\n")
+            _webui_send({"type": "transcription", "source": source,
+                         "src_lang": src_label, "src_text": src_text,
+                         "dst_lang": dst_label, "dst_text": result,
+                         "asr_time": round(asr_elapsed, 1),
+                         "translate_time": round(elapsed, 1),
+                         "timestamp": timestamp})
 
     def translate_and_print(seq, src_text, translator, pending, next_seq, lock, source, asr_elapsed=0):
         with _active_trans_lock:
@@ -6296,8 +6469,7 @@ def run_stream_bidirectional(lb_device_id, mic_device_id,
             t0 = time.monotonic()
             result = translator.translate(src_text)
             elapsed = time.monotonic() - t0
-            # 翻譯結果可能殘留簡體字（LLM 輸出不穩定），統一轉繁體
-            if result:
+            if result and not isinstance(translator, OllamaTranslator):
                 result = S2TWP.convert(result)
             with lock:
                 pending[seq] = (src_text, result, elapsed, asr_elapsed)
@@ -6410,8 +6582,8 @@ def run_stream_bidirectional(lb_device_id, mic_device_id,
     def drain_ordered_results(source, pending_res, next_disp, res_lock,
                               trans_seq, trans_pending, trans_next, trans_lock,
                               translator, recent, lang, hallucination_check,
-                              skip_english=False):
-        """排乾辨識結果。skip_english: 偵測到英文時跳過翻譯直接顯示"""
+                              skip_langs=None):
+        """排乾辨識結果。skip_langs: set of lang codes，偵測到這些語言時跳過翻譯直接顯示"""
         _NOT_READY = object()
         labels = bidi_cfg[source]
         src_color, src_label = labels[0], labels[1]
@@ -6432,7 +6604,7 @@ def run_stream_bidirectional(lb_device_id, mic_device_id,
                 continue
             # 語言預偵測模式：用 detected_lang 決定處理邏輯
             _effective_lang = detected_lang if (lang is None) else lang
-            _skip_this = (skip_english and _effective_lang == "en")
+            _skip_this = (skip_langs is not None and _effective_lang in skip_langs)
             _hallu_fn = _hallu_by_lang.get(_effective_lang, hallucination_check) if (lang is None) else hallucination_check
             lines = []
             if segments:
@@ -6458,8 +6630,9 @@ def run_stream_bidirectional(lb_device_id, mic_device_id,
                     # 不翻譯：直接塞入翻譯佇列，用 _NO_TRANSLATE 哨兵
                     with trans_lock:
                         trans_pending[seq] = (line, _NO_TRANSLATE, 0, proc_time)
+                    _lbl = {"en": "EN", "ja": "日", "zh": "中"}.get(_effective_lang, _effective_lang.upper()) if _skip_this else None
                     _drain_translations(trans_pending, trans_next, trans_lock, source,
-                                        label_override="EN" if _skip_this else None)
+                                        label_override=_lbl)
                 else:
                     threading.Thread(
                         target=translate_and_print,
@@ -6555,6 +6728,7 @@ def run_stream_bidirectional(lb_device_id, mic_device_id,
     else:
         _listen_mic_hint = f"{_mic_color}▶ 麥克風（{_mic_dir}）{RESET}"
     print(f"\n{C_OK}{BOLD}開始監聽...{RESET} {C_OK}◀ 系統音訊（{_lb_dir}）{RESET}  {_listen_mic_hint}\n\n", flush=True)
+    _webui_send({"type": "started", "mode": mode})
 
     _tr_model = translator_lb.model if isinstance(translator_lb, OllamaTranslator) else ("NLLB" if isinstance(translator_lb, NllbTranslator) else "")
     _tr_loc = "伺服器" if isinstance(translator_lb, OllamaTranslator) else ("本機" if isinstance(translator_lb, NllbTranslator) else "")
@@ -6639,7 +6813,7 @@ def run_stream_bidirectional(lb_device_id, mic_device_id,
             drain_ordered_results("mic", mic_pending_results, mic_next_display_seq, mic_results_lock,
                                   _trans_seq_mic, _trans_pending_mic, _trans_next_mic, _trans_lock_mic,
                                   translator_mic, mic_recent, mic_lang, mic_hallu,
-                                  skip_english=_mic_skip_english)
+                                  skip_langs=_mic_skip_langs)
 
     except KeyboardInterrupt:
         signal_handler(signal.SIGINT, None)
@@ -8027,6 +8201,9 @@ class _SummaryStatusBar:
             gen_elapsed = time.monotonic() - self._first_token_time
             tps = self._tokens / gen_elapsed if gen_elapsed > 0.1 else 0
             self._frozen_stats = f"{self._tokens} tokens | {tps:.1f} t/s"
+            _stage = f"{self._task}（{self._model}）" if self._model else self._task
+            _webui_send({"type": "progress", "stage": f"{_stage} 完成",
+                         "detail": f"{self._tokens} tokens | {tps:.1f} t/s"})
         else:
             self._frozen_stats = ""
         self._frozen = True
@@ -8035,6 +8212,13 @@ class _SummaryStatusBar:
         self._tokens = count
         if count > 0 and not self._first_token_time:
             self._first_token_time = time.monotonic()
+        # WebUI 即時 token 進度（每 5 tokens 更新一次避免洪水）
+        if count > 0 and count % 5 == 0 and self._first_token_time:
+            gen_elapsed = time.monotonic() - self._first_token_time
+            tps = count / gen_elapsed if gen_elapsed > 0.1 else 0
+            _stage = f"{self._task}（{self._model}）" if self._model else self._task
+            _webui_send({"type": "progress", "stage": _stage,
+                         "detail": f"{count} tokens | {tps:.1f} t/s"})
 
     def _draw_title(self):
         """conhost fallback: 用視窗標題顯示摘要進度"""
@@ -8890,6 +9074,7 @@ def process_audio_file(input_path, mode, translator, model_size="large-v3-turbo"
 
     print(f"  {C_WHITE}辨識語言    {lang}{RESET}")
     print(f"  {C_DIM}記錄檔      {os.path.relpath(session_dir)}/{RESET}")
+    _webui_send({"type": "progress", "stage": "準備中", "detail": os.path.basename(input_path)})
 
     # 標籤
     src_color, src_label, dst_color, dst_label = _MODE_LABELS[mode]
@@ -8936,6 +9121,7 @@ def process_audio_file(input_path, mode, translator, model_size="large-v3-turbo"
         rw_host = remote_whisper_cfg.get("host", "?")
         rw_port = remote_whisper_cfg.get("whisper_port", REMOTE_WHISPER_DEFAULT_PORT)
         print(f"  {C_WHITE}上傳辨識中...{RESET}\n")
+        _webui_send({"type": "progress", "stage": "辨識中", "detail": f"GPU 伺服器（{rw_host}）"})
 
         sbar = _SummaryStatusBar(model=model_size, task="上傳音訊", asr_location="伺服器").start()
 
@@ -8976,6 +9162,7 @@ def process_audio_file(input_path, mode, translator, model_size="large-v3-turbo"
         model = _call_with_ssl_retry(WhisperModel, model_size, device="auto", compute_type="int8")
         print(f"{C_OK}✓{RESET}")
         print(f"  {C_WHITE}辨識中...{RESET}\n")
+        _webui_send({"type": "progress", "stage": "辨識中", "detail": f"本機 {model_size}"})
 
         sbar = _SummaryStatusBar(model=model_size, task="辨識中", asr_location="本機").start()
         if audio_duration > 0:
@@ -9027,11 +9214,14 @@ def process_audio_file(input_path, mode, translator, model_size="large-v3-turbo"
         _avg_asr_per_seg = t_asr_elapsed / max(len(valid_segments), 1)
         sbar.set_task(f"辨識完成（{len(valid_segments)} 段，{t_asr_elapsed:.1f}s）", reset_timer=False)
         sbar.set_progress("")
+        _webui_send({"type": "progress", "stage": "辨識完成",
+                     "detail": f"{len(valid_segments)} 段，{t_asr_elapsed:.1f}s"})
 
         # 講者辨識
         speaker_labels = None
         t_stage = time.monotonic()
         if diarize and valid_segments:
+            _webui_send({"type": "progress", "stage": "講者辨識中", "detail": ""})
             # 優先嘗試GPU 伺服器 diarization
             if remote_whisper_cfg is not None:
                 sbar.set_task("伺服器講者辨識（上傳中）", reset_timer=False)
@@ -9056,6 +9246,8 @@ def process_audio_file(input_path, mode, translator, model_size="large-v3-turbo"
                                                    num_speakers=num_speakers, sbar=sbar)
             t_diarize_elapsed = time.monotonic() - t_stage
             sbar.set_task(f"講者辨識完成（{t_diarize_elapsed:.1f}s）", reset_timer=False)
+            _webui_send({"type": "progress", "stage": "講者辨識完成",
+                         "detail": f"{t_diarize_elapsed:.1f}s"})
 
         # 等待背景預熱完成（ASR 期間已開始，通常此時早已 ready）
         if _warmup_thread is not None:
@@ -9081,6 +9273,7 @@ def process_audio_file(input_path, mode, translator, model_size="large-v3-turbo"
                 ts_tag = f"[{ts_start}-{ts_end}]"
 
                 sbar.set_task(f"輸出中（{seg_count}/{len(valid_segments)}）", reset_timer=False)
+                _webui_send({"type": "progress", "stage": "輸出中", "detail": f"{seg_count}/{len(valid_segments)}"})
 
                 # 講者標籤
                 spk_tag_term = ""  # 終端機用（帶色彩）
@@ -9105,6 +9298,7 @@ def process_audio_file(input_path, mode, translator, model_size="large-v3-turbo"
                     elapsed = time.monotonic() - t0
 
                     if result:
+                        if not isinstance(translator, OllamaTranslator): result = S2TWP.convert(result)
                         _print_with_badge(
                             f"{dst_color}{BOLD}{ts_tag} {spk_tag_term}[{dst_label}] {result}{RESET}",
                             _speed_badge_color(elapsed), elapsed, "譯")
@@ -9112,6 +9306,13 @@ def process_audio_file(input_path, mode, translator, model_size="large-v3-turbo"
 
                         log_f.write(f"{ts_tag} {spk_tag_log}[{src_label}] {text}\n")
                         log_f.write(f"{ts_tag} {spk_tag_log}[{dst_label}] {result}\n\n")
+                        _webui_send({"type": "transcription", "source": "main",
+                                     "src_lang": src_label, "src_text": text,
+                                     "dst_lang": dst_label, "dst_text": result,
+                                     "asr_time": round(_avg_asr_per_seg, 1),
+                                     "translate_time": round(elapsed, 1),
+                                     "timestamp": ts_tag,
+                                     "speaker": spk_num_val})
                         seg_lines.append({"label": src_label, "text": text})
                         seg_lines.append({"label": dst_label, "text": result})
                     else:
@@ -9123,6 +9324,11 @@ def process_audio_file(input_path, mode, translator, model_size="large-v3-turbo"
                     print(flush=True)
                     log_f.write(f"{ts_tag} {spk_tag_log}[{src_label}] {text}\n\n")
                     seg_lines.append({"label": src_label, "text": text})
+                    _webui_send({"type": "transcription", "source": "main",
+                                 "src_lang": src_label, "src_text": text,
+                                 "asr_time": round(_avg_asr_per_seg, 1),
+                                 "timestamp": ts_tag,
+                                 "speaker": spk_num_val})
 
                 segments_data.append({
                     "start": seg["start"], "end": seg["end"],
@@ -9141,6 +9347,7 @@ def process_audio_file(input_path, mode, translator, model_size="large-v3-turbo"
         if correct_with_llm and segments_data and llm_model:
             sbar.stop()  # 停掉原本的狀態列，避免與校正狀態列衝突
             print(f"\n  {C_WHITE}LLM 校正逐字稿文字...{RESET}")
+            _webui_send({"type": "progress", "stage": f"LLM 校正逐字稿（{llm_model}）", "detail": "等待模型回應..."})
             try:
                 _correct_segments_with_llm(segments_data, llm_model, llm_host, llm_port,
                                            server_type=llm_server_type, topic=meeting_topic)
@@ -9228,6 +9435,8 @@ def process_audio_file(input_path, mode, translator, model_size="large-v3-turbo"
 
         _html = transcript_html_path if segments_data else None
 
+        _webui_send({"type": "progress", "stage": "處理完成",
+                     "detail": f"{seg_count} 段{diarize_info} | {total_str}"})
         print(f"\n{C_DIM}{'═' * 60}{RESET}")
         print(f"  {C_OK}{BOLD}處理完成{RESET} {C_DIM}（共 {seg_count} 段{diarize_info} | 耗時 {total_str}）{RESET}")
         print(f"  {C_WHITE}{log_path}{RESET}")
@@ -9917,11 +10126,14 @@ def summarize_log_file(input_path, model, host, port, server_type="ollama",
 
     _llm_loc = "本機" if host in ("localhost", "127.0.0.1", "::1") else "伺服器"
     sbar = _SummaryStatusBar(model=model, task="準備中", location=_llm_loc).start()
+    _webui_send({"type": "progress", "stage": f"生成摘要（{model}）", "detail": "準備中..."})
 
     if len(chunks) <= 1:
         # 單段：直接摘要
         prompt = _summary_prompt(transcript, topic=topic, summary_mode=summary_mode)
         sbar.set_task(f"生成摘要（單段，{len(transcript)} 字）")
+        _webui_send({"type": "progress", "stage": f"生成摘要（{model}）",
+                     "detail": f"單段，{len(transcript)} 字"})
         summary = call_ollama_raw(prompt, model, host, port, spinner=sbar, live_output=True,
                                   server_type=server_type)
     else:
@@ -9929,6 +10141,8 @@ def summarize_log_file(input_path, model, host, port, server_type="ollama",
         segment_summaries = []
         for i, chunk in enumerate(chunks):
             sbar.set_task(f"第 {i+1}/{len(chunks)} 段（{len(chunk)} 字）")
+            _webui_send({"type": "progress", "stage": f"生成摘要（{model}）",
+                         "detail": f"第 {i+1}/{len(chunks)} 段，{len(chunk)} 字"})
             prompt = _summary_prompt(chunk, topic=topic, summary_mode=summary_mode)
             seg = call_ollama_raw(prompt, model, host, port, spinner=sbar, live_output=True,
                                   server_type=server_type)
@@ -9952,6 +10166,8 @@ def summarize_log_file(input_path, model, host, port, server_type="ollama",
         else:
             # 合併各段摘要
             sbar.set_task(f"合併 {len(chunks)} 段摘要")
+            _webui_send({"type": "progress", "stage": f"生成摘要（{model}）",
+                         "detail": f"合併 {len(chunks)} 段"})
             combined = "\n\n---\n\n".join(
                 f"### 第 {i+1} 段\n{s}" for i, s in enumerate(segment_summaries)
             )
@@ -10937,6 +11153,8 @@ def setup_status_bar(mode="en2zh", model_name="", asr_location="",
         _status_bar_active = False
 
 
+_webui_rms_last = [0.0]  # 上次送 RMS 的時間
+
 def _push_rms(rms):
     """Thread-safe 寫入一筆 RMS 值到狀態列波形歷史"""
     lock = _status_bar_state.get("rms_lock")
@@ -10944,6 +11162,11 @@ def _push_rms(rms):
     if lock and hist is not None:
         with lock:
             hist.append(rms)
+    # WebUI RMS（每 0.5 秒最多送一次，避免洪水）
+    now = time.monotonic()
+    if _webui_queue is not None and now - _webui_rms_last[0] > 1.0:
+        _webui_rms_last[0] = now
+        _webui_send({"type": "rms", "value": round(rms, 4)})
 
 
 def _refresh_title_bar():
@@ -11317,6 +11540,9 @@ def parse_args():
     parser.add_argument(
         "--restart-server", action="store_true",
         help="強制重啟GPU 伺服器（更新 server.py 後使用）")
+    parser.add_argument(
+        "--webui", action="store_true",
+        help="同時將即時字幕推送到 WebUI（需另外啟動 webui.py）")
     return parser.parse_args()
 
 
@@ -11481,6 +11707,10 @@ def main():
     args = parse_args()
     cli_mode = (len(sys.argv) > 1 and not args.list_devices
                 and args.summarize is None and not args.input)
+
+    # --webui：啟動 event sender（webui.py 由 start.sh 或使用者另外啟動）
+    if args.webui:
+        _start_webui_sender()
 
     # --rec-device 自動啟用 --record
     if args.rec_device is not None and not args.record:
@@ -12700,6 +12930,9 @@ def main():
                 # 非翻譯模式（純轉錄）：仍詢問主題（用於記錄檔命名）
                 meeting_topic = _ask_topic()
 
+            # 場景（音訊緩衝長度）
+            length_ms, step_ms = select_scene()
+
             # 錄音
             record, rec_device = _ask_record()
 
@@ -12716,7 +12949,8 @@ def main():
             if not _confirm_start(_build_cli_command(**_cli_kw)):
                 sys.exit(0)
             run_stream_remote(capture_id, translator, r_model_name, REMOTE_WHISPER_CONFIG,
-                              mode, record=record, rec_device=rec_device,
+                              mode, length_ms=length_ms, step_ms=step_ms,
+                              record=record, rec_device=rec_device,
                               force_restart=args.restart_server,
                               meeting_topic=meeting_topic,
                               denoise=args.denoise)

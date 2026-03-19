@@ -196,7 +196,7 @@ spinner_stop() {
 print_title() {
     echo ""
     echo -e "${C_TITLE}============================================================${NC}"
-    echo -e "${C_TITLE}${BOLD}  jt-live-whisper v2.12.0 - 100% 全地端 AI 語音工具集 - 安裝程式${NC}"
+    echo -e "${C_TITLE}${BOLD}  jt-live-whisper v2.14.0 - 100% 全地端 AI 語音工具集 - 安裝程式${NC}"
     echo -e "${C_TITLE}  by Jason Cheng (Jason Tools)${NC}"
     echo -e "${C_TITLE}============================================================${NC}"
     echo ""
@@ -784,6 +784,18 @@ check_venv() {
     if ! python3 -c "import noisereduce" &>/dev/null 2>&1; then
         missing_pkgs+=("noisereduce")
     fi
+    if ! python3 -c "import fastapi" &>/dev/null 2>&1; then
+        missing_pkgs+=("fastapi")
+    fi
+    if ! python3 -c "import uvicorn" &>/dev/null 2>&1; then
+        missing_pkgs+=("uvicorn")
+    fi
+    if ! python3 -c "import websockets" &>/dev/null 2>&1; then
+        missing_pkgs+=("websockets")
+    fi
+    if ! python3 -c "import multipart" &>/dev/null 2>&1; then
+        missing_pkgs+=("python-multipart")
+    fi
 
     # 套件中文說明對照（pip 套件名 → 說明）
     _pkg_label() {
@@ -797,6 +809,10 @@ check_venv() {
             resemblyzer)               echo "resemblyzer（講者辨識 - 聲紋提取）" ;;
             spectralcluster)           echo "spectralcluster（講者辨識 - 分群）" ;;
             noisereduce)               echo "noisereduce（背景降噪）" ;;
+            fastapi)                   echo "fastapi（WebUI 伺服器）" ;;
+            uvicorn)                   echo "uvicorn（WebUI ASGI 伺服器）" ;;
+            websockets)                echo "websockets（WebUI 即時通訊）" ;;
+            python-multipart)          echo "python-multipart（WebUI 檔案上傳）" ;;
             *)                         echo "$1" ;;
         esac
     }
@@ -1044,7 +1060,8 @@ print('found' if found else 'notfound')
         fi
         check_install "正在下載 faster-whisper $fw_model 模型（$fw_size）..."
         echo ""
-        hf_download "Systran/faster-whisper-$fw_model" "faster-whisper 模型" ""
+        # mobiuslabsgmbh 是 faster-whisper 內部預設的 repo（Systran 已需認證）
+        hf_download "mobiuslabsgmbh/faster-whisper-$fw_model" "faster-whisper 模型" ""
         echo ""
 
         # 驗證下載
@@ -1216,7 +1233,7 @@ do_upgrade() {
 
     # 更新主要程式檔案
     local files_updated=0
-    for fname in translate_meeting.py start.sh install.sh SOP.md; do
+    for fname in translate_meeting.py start.sh install.sh SOP.md webui.py webui.html; do
         if [ -f "$repo_dir/$fname" ]; then
             cp "$repo_dir/$fname" "$SCRIPT_DIR/$fname"
             ((files_updated++)) || true
