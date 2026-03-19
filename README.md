@@ -385,7 +385,9 @@ cd C:\jt-live-whisper
 
 ![WebUI 對話模式](images/webui-chat.png)
 
-**字幕模式**（電影風格，黑底大字，支援雙向顯示）
+**字幕模式**（電影風格，黑底大字）
+
+![WebUI 字幕模式](images/webui-subtitle.png)
 
 ![WebUI 字幕模式 - 雙向](images/webui-subtitle-bidi.png)
 
