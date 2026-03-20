@@ -1,5 +1,12 @@
 # Changelog
 
+### v2.14.7 (2026-03-20)
+
+**修正**
+- install.ps1 whisper.cpp 編譯：非 CUDA 模式明確設定 `-DGGML_CUDA=OFF`（避免 cmake 自動偵測 nvcc 導致失敗）
+- install.ps1 whisper.cpp CUDA 編譯失敗自動降級 CPU：擴大偵測範圍（含 cmake 自動偵測 CUDA 的失敗情境）
+- install.ps1 CUDA Toolkit 偵測改用 nvcc.exe 驗證（不再僅檢查目錄存在）
+
 ### v2.14.6 (2026-03-20)
 
 **修正**

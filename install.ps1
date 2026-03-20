@@ -301,7 +301,7 @@ $banner_line = '=' * $cols
 
 Write-Host ""
 Write-Host "${C_TITLE}${banner_line}${NC}"
-Write-Host "${C_TITLE}${BOLD}  jt-live-whisper v2.14.6 - 100% 全地端 AI 語音工具集 - Windows 安裝程式${NC}"
+Write-Host "${C_TITLE}${BOLD}  jt-live-whisper v2.14.7 - 100% 全地端 AI 語音工具集 - Windows 安裝程式${NC}"
 Write-Host "${C_TITLE}  by Jason Cheng (Jason Tools)${NC}"
 Write-Host "${C_TITLE}${banner_line}${NC}"
 Write-Host ""
@@ -1094,9 +1094,11 @@ if ($true) {
     if ($GPU_AVAILABLE) {
         $hasCudaTK = Test-Path "${env:CUDA_PATH}\bin\nvcc.exe"
         if (-not $hasCudaTK) {
-            # 嘗試常見路徑
+            # 嘗試常見路徑（必須確認 nvcc.exe 存在，不只是目錄）
             $cudaPaths = Get-ChildItem "C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA" -Directory -ErrorAction SilentlyContinue
-            if ($cudaPaths) { $hasCudaTK = $true }
+            foreach ($cp in $cudaPaths) {
+                if (Test-Path (Join-Path $cp.FullName "bin\nvcc.exe")) { $hasCudaTK = $true; break }
+            }
         }
         if ($hasCudaTK) {
             check_ok "CUDA Toolkit"
@@ -1216,6 +1218,9 @@ if ($true) {
             if ($GPU_AVAILABLE -and $hasCudaTK) {
                 $cmakeArgs += "-DGGML_CUDA=ON"
                 $buildDesc = "CUDA GPU 加速版"
+            } else {
+                # 明確停用 CUDA，避免 cmake 自動偵測到 nvcc 而嘗試啟用
+                $cmakeArgs += "-DGGML_CUDA=OFF"
             }
 
             # 若有舊的 build 目錄，先清除（避免快取干擾）
@@ -1226,12 +1231,15 @@ if ($true) {
             info "CMake 設定（${buildDesc}）..."
             $cmakeOutput = & cmake @cmakeArgs 2>&1
 
-            if ($LASTEXITCODE -ne 0 -and $buildDesc -eq "CUDA GPU 加速版") {
-                # CUDA 編譯失敗（常見：CUDA Toolkit 與 VS 整合不完整），自動降級為 CPU 版
+            # CUDA 編譯失敗（含 cmake 自動偵測 CUDA 導致的失敗）→ 自動降級 CPU
+            $cmakeOutStr = ($cmakeOutput | ForEach-Object { "$_" }) -join "`n"
+            $isCudaFail = ($LASTEXITCODE -ne 0) -and ($buildDesc -eq "CUDA GPU 加速版" -or $cmakeOutStr -match "CUDA|cuda")
+            if ($isCudaFail) {
                 check_warn "CUDA 編譯設定失敗，自動改用 CPU 版編譯"
                 info "（whisper.cpp 即時辨識改用 CPU，不影響 faster-whisper 的 CUDA 加速）"
-                info "若需 GPU 加速 whisper.cpp，請重新安裝 CUDA Toolkit 並勾選 Visual Studio Integration"
-                $cmakeArgs = $cmakeArgs | Where-Object { $_ -ne "-DGGML_CUDA=ON" }
+                info "若需 GPU 加速 whisper.cpp，請在 Developer PowerShell for VS 中重新執行"
+                $cmakeArgs = ($cmakeArgs | Where-Object { $_ -ne "-DGGML_CUDA=ON" }) + @("-DGGML_CUDA=OFF")
+                $cmakeArgs = $cmakeArgs | Select-Object -Unique
                 $buildDesc = "CPU 版（CUDA 降級）"
                 if (Test-Path $buildDir) {
                     Remove-Item $buildDir -Recurse -Force -ErrorAction SilentlyContinue
