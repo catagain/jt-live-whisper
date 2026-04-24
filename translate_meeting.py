@@ -9009,6 +9009,61 @@ def _ask_topic(record_only=False):
     return None
 
 
+def _ask_record_video():
+    """互動選單：詢問是否錄製螢幕畫面。
+    回傳 True/False。"""
+    default_idx = 0  # 預設不錄影
+    options = [
+        ("不錄製", "僅進行即時轉錄/翻譯"),
+        ("錄製螢幕畫面", "輸出 MP4 到 recordings/（需 ffmpeg）"),
+    ]
+
+    print(f"\n\n{C_TITLE}{BOLD}▎ 錄製螢幕畫面{RESET}")
+    print(f"{C_DIM}{'─' * 60}{RESET}")
+
+    if not IS_WINDOWS:
+        print(f"  {C_DIM}目前僅 Windows 版本支援此功能，將自動略過{RESET}")
+        print(f"{C_DIM}{'─' * 60}{RESET}")
+        print(f"  {C_OK}→ 不錄製{RESET}\n")
+        return False
+
+    for i, (label, desc) in enumerate(options):
+        if i == default_idx:
+            print(f"  {C_HIGHLIGHT}{BOLD}[{i}] {label:12s}{RESET} {C_WHITE}{desc}{RESET}  {C_HIGHLIGHT}{REVERSE} 預設 {RESET}")
+        else:
+            print(f"  {C_DIM}[{i}]{RESET} {C_WHITE}{label:12s}{RESET} {C_DIM}{desc}{RESET}")
+    print(f"{C_DIM}{'─' * 60}{RESET}")
+    print(f"{C_WHITE}按 Enter 使用預設，或輸入編號：{RESET}", end=" ")
+
+    try:
+        user_input = input().strip()
+    except (EOFError, KeyboardInterrupt):
+        print()
+        sys.exit(0)
+
+    idx = default_idx
+    if user_input:
+        try:
+            idx = int(user_input)
+            if not (0 <= idx < len(options)):
+                idx = default_idx
+        except ValueError:
+            idx = default_idx
+
+    if idx == 1:
+        import shutil as _shutil
+        if not _shutil.which("ffmpeg"):
+            print(f"  {C_HIGHLIGHT}[提醒] 找不到 ffmpeg，將改為不錄製螢幕畫面{RESET}")
+            print(f"  {C_DIM}可先安裝：winget install Gyan.FFmpeg{RESET}")
+            print(f"  {C_OK}→ 不錄製{RESET}\n")
+            return False
+        print(f"  {C_OK}→ 錄製螢幕畫面{RESET}\n")
+        return True
+
+    print(f"  {C_OK}→ 不錄製{RESET}\n")
+    return False
+
+
 def open_file_in_editor(file_path):
     """用系統預設程式開啟檔案"""
     try:
@@ -14108,6 +14163,9 @@ def main():
             except (EOFError, KeyboardInterrupt):
                 print()
 
+            # 錄影
+            record_video = _ask_record_video()
+
             # 場景（音訊緩衝長度）
             length_ms, step_ms = select_scene()
 
@@ -14115,6 +14173,7 @@ def main():
                            engine=engine,
                            llm_model=model if engine == "llm" else None,
                            llm_host=f"{host}:{port}" if engine == "llm" else None,
+                           record_video=record_video,
                            denoise=args.denoise)
             if not _confirm_start(_build_cli_command(**_cli_kw)):
                 sys.exit(0)
@@ -14124,7 +14183,7 @@ def main():
                                      model_name, mode,
                                      length_ms=length_ms, step_ms=step_ms,
                                      record=record_bidi,
-                                     record_video=args.record_video, video_device=args.video_device,
+                                     record_video=record_video, video_device=args.video_device,
                                      meeting_topic=meeting_topic,
                                      use_mlx=_use_mlx_bidi,
                                      denoise=args.denoise)
@@ -14186,12 +14245,16 @@ def main():
             # 錄音
             record, rec_device = _ask_record()
 
+            # 錄影
+            record_video = _ask_record_video()
+
             # 音訊裝置（PortAudio，不是 SDL2）
             capture_id = list_audio_devices_sd()
 
             _cli_kw = dict(mode=mode, model=r_model_name, device=capture_id,
                            topic=meeting_topic,
                            record=record, rec_device=rec_device,
+                           record_video=record_video,
                            engine=engine if mode in _TRANSLATE_MODES else None,
                            llm_model=model if mode in _TRANSLATE_MODES and engine == "llm" else None,
                            llm_host=f"{host}:{port}" if mode in _TRANSLATE_MODES and engine == "llm" else None,
@@ -14201,7 +14264,7 @@ def main():
             run_stream_remote(capture_id, translator, r_model_name, REMOTE_WHISPER_CONFIG,
                               mode, length_ms=length_ms, step_ms=step_ms,
                               record=record, rec_device=rec_device,
-                              record_video=args.record_video, video_device=args.video_device,
+                              record_video=record_video, video_device=args.video_device,
                               force_restart=args.restart_server,
                               meeting_topic=meeting_topic,
                               denoise=args.denoise)
@@ -14276,6 +14339,9 @@ def main():
             # 詢問是否錄音（自動偵測錄音裝置）
             record, rec_device = _ask_record(prefer_mix=_early_mic)
 
+            # 錄影（Moonshine 暫不支援）
+            record_video = _ask_record_video() if asr_engine == "whisper" else False
+
             # 詢問是否同時轉錄麥克風
             use_mic = False
             bidi_devs = _early_bidi_devs  # 轉錄模式已提前偵測
@@ -14324,6 +14390,7 @@ def main():
                     _cli_kw = dict(mode=mode, model=_mic_model,
                                    topic=meeting_topic,
                                    record=record,
+                                   record_video=record_video,
                                    engine=engine if mode in _TRANSLATE_MODES else None,
                                    llm_model=model if _need_llm else None,
                                    llm_host=f"{host}:{port}" if _need_llm else None,
@@ -14335,7 +14402,7 @@ def main():
                                              _mic_model, mode,
                                              length_ms=length_ms, step_ms=step_ms,
                                              record=record,
-                                             record_video=args.record_video, video_device=args.video_device,
+                                             record_video=record_video, video_device=args.video_device,
                                              meeting_topic=meeting_topic,
                                              use_mlx=_use_mlx_mic,
                                              mic_translate=False,
@@ -14347,6 +14414,7 @@ def main():
                     _cli_kw = dict(mode=mode, model=model_name,
                                    device=capture_id, topic=meeting_topic,
                                    record=record, rec_device=rec_device,
+                                   record_video=record_video,
                                    engine=engine if mode in _TRANSLATE_MODES else None,
                                    llm_model=model if _need_llm else None,
                                    llm_host=f"{host}:{port}" if _need_llm else None,
@@ -14356,7 +14424,7 @@ def main():
                     run_stream_local_whisper(capture_id, translator, model_name, mode,
                                             length_ms=length_ms, step_ms=step_ms,
                                             record=record, rec_device=rec_device,
-                                            record_video=args.record_video, video_device=args.video_device,
+                                            record_video=record_video, video_device=args.video_device,
                                             meeting_topic=meeting_topic,
                                             denoise=args.denoise)
                 else:
@@ -14365,6 +14433,7 @@ def main():
                     _cli_kw = dict(mode=mode, model=model_name,
                                    device=capture_id, topic=meeting_topic,
                                    record=record, rec_device=rec_device,
+                                   record_video=record_video,
                                    engine=engine if mode in _TRANSLATE_MODES else None,
                                    llm_model=model if _need_llm else None,
                                    llm_host=f"{host}:{port}" if _need_llm else None)
@@ -14372,7 +14441,7 @@ def main():
                         sys.exit(0)
                     run_stream(capture_id, translator, model_name, model_path, length_ms, step_ms, mode,
                                record=record, rec_device=rec_device,
-                               record_video=args.record_video, video_device=args.video_device,
+                               record_video=record_video, video_device=args.video_device,
                                meeting_topic=meeting_topic)
 
 
