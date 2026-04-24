@@ -8850,7 +8850,7 @@ def _ask_record(prefer_mix=False):
     print(f"\n\n{C_TITLE}{BOLD}▎ 錄製音訊{RESET}")
     print(f"{C_DIM}{'─' * 60}{RESET}")
     print(f"  {C_WHITE}同時錄製音訊為 WAV 檔（儲存於 recordings/）{RESET}")
-    print(f"  {C_DIM}* 即時辨識僅處理播放聲音，無法即時辨識我方說話的聲音{RESET}")
+    print(f"  {C_DIM}* 這個選單只控制錄音內容，不影響是否啟用麥克風即時轉錄{RESET}")
     print()
 
     # 選項文字固定寬度對齊（「混合錄製（輸出+輸入）」顯示寬 20 全形字元）
