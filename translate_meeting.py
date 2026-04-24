@@ -20,7 +20,6 @@ import threading
 import time
 import wave
 from collections import deque
-from functools import lru_cache
 
 IS_WINDOWS = sys.platform == "win32"
 IS_MACOS = sys.platform == "darwin"
@@ -633,14 +632,12 @@ WHISPER_MODELS = [
 
 # ── CPU 效能評估（自動選擇適合的 Whisper 模型）──
 
-@lru_cache(maxsize=1)
 def _is_apple_silicon():
     """偵測是否為 Apple Silicon (ARM64) Mac"""
     import platform
     return IS_MACOS and platform.machine() == "arm64"
 
 
-@lru_cache(maxsize=1)
 def _has_local_gpu():
     """本機是否有 GPU 加速（Apple Silicon Metal 或 NVIDIA CUDA）"""
     if _is_apple_silicon():
@@ -651,65 +648,17 @@ def _has_local_gpu():
     return False
 
 
-@lru_cache(maxsize=1)
-def _get_system_memory_gb():
-    """取得系統實體記憶體大小（GB）"""
-    try:
-        if IS_MACOS:
-            result = subprocess.run(["sysctl", "-n", "hw.memsize"],
-                                    capture_output=True, text=True, timeout=5)
-            return int(result.stdout.strip()) / (1024 ** 3)
-        elif IS_WINDOWS:
-            import ctypes
-            kernel32 = ctypes.windll.kernel32
-            c_ulong = ctypes.c_ulonglong
-            mem = c_ulong()
-            kernel32.GetPhysicallyInstalledSystemMemory(ctypes.byref(mem))
-            return mem.value / (1024 * 1024)  # KB → GB
-        else:
-            with open("/proc/meminfo") as f:
-                for line in f:
-                    if line.startswith("MemTotal"):
-                        return int(line.split()[1]) / (1024 * 1024)  # KB → GB
-    except Exception:
-        pass
-    return 0
-
-
-def _recommended_mic_engine(mode="zh", remote_whisper_cfg=None):
-    """推薦麥克風轉錄的 ASR 引擎與模型。
-    優先順序：GPU 伺服器 > mlx GPU > 本機 CPU。
-    回傳 (engine, model)：engine = 'remote' | 'mlx' | 'cpu', model = 模型名。"""
-    _need_multilang = mode in _NOENG_MODELS
-    # 1. 有 GPU 伺服器 → 優先遠端（macOS / Windows 都適用）
-    if remote_whisper_cfg:
-        return "remote", "large-v3-turbo"
-    # 2. Apple Silicon + mlx-whisper → GPU 加速（依記憶體選模型）
-    if _is_apple_silicon() and _has_mlx_whisper():
-        mem_gb = _get_system_memory_gb()
-        if mem_gb >= 24:
-            return "mlx", "large-v3-turbo"
-        elif mem_gb >= 16:
-            return "mlx", "small" if _need_multilang else "small.en"
-        else:
-            return "cpu", "small" if _need_multilang else "base.en"
-    # 3. 本機 CPU
-    return "cpu", "small" if _need_multilang else "base.en"
-
-
-@lru_cache(maxsize=1)
 def _has_mlx_whisper():
     """Apple Silicon 且已安裝 mlx-whisper"""
     if not _is_apple_silicon():
         return False
     try:
-        import importlib.util
-        return importlib.util.find_spec("mlx_whisper") is not None
-    except Exception:
+        import mlx_whisper  # noqa: F401
+        return True
+    except ImportError:
         return False
 
 
-@lru_cache(maxsize=16)
 def _recommended_whisper_model(mode="en2zh"):
     """根據 CPU 架構與核心數推薦此裝置最適合的即時 Whisper 模型。
     Apple Silicon 有 Metal GPU 加速，同核心數效能遠高於 Intel CPU。"""
@@ -773,22 +722,123 @@ ASR_ENGINES = [
     ("moonshine", "Moonshine", "真串流，低延遲，僅英文"),
 ]
 
-APP_VERSION = "2.16.1"
+APP_VERSION = "2.15.5"
 
 # ─── WebUI 暫停控制（SIGUSR1 toggle）──────────────────────────────
 _webui_pause_event = None  # 由各 streaming 函式設定
+_active_video_recorder = None
+_active_video_recorder_lock = threading.Lock()
+_WEBUI_PAUSE_CMD_FILE = os.path.join(SCRIPT_DIR, ".webui_pause_cmd")
+
+
+def _set_active_video_recorder(recorder):
+    global _active_video_recorder
+    with _active_video_recorder_lock:
+        _active_video_recorder = recorder
+
+
+def _clear_active_video_recorder_if(recorder):
+    global _active_video_recorder
+    with _active_video_recorder_lock:
+        if _active_video_recorder is recorder:
+            _active_video_recorder = None
+
+
+def _toggle_active_video_recorder(paused: bool):
+    with _active_video_recorder_lock:
+        recorder = _active_video_recorder
+    if recorder is None:
+        return
+    try:
+        if paused:
+            recorder.pause()
+        else:
+            recorder.resume()
+    except Exception:
+        pass
+
+
+def _emit_pause_state(paused: bool):
+    _webui_send({"type": "pause_state", "paused": bool(paused)})
+
+
+def _apply_pause_state(pause_event, paused: bool):
+    if pause_event is None:
+        return False
+    cur = pause_event.is_set()
+    if paused == cur:
+        _emit_pause_state(paused)
+        return False
+    if paused:
+        pause_event.set()
+    else:
+        pause_event.clear()
+    _status_bar_state["paused"] = paused
+    _toggle_active_video_recorder(paused)
+    _emit_pause_state(paused)
+    return True
+
+
+def _toggle_pause_state(pause_event):
+    if pause_event is None:
+        return False
+    return _apply_pause_state(pause_event, not pause_event.is_set())
+
+
+def _clear_webui_pause_cmd_file():
+    try:
+        os.remove(_WEBUI_PAUSE_CMD_FILE)
+    except OSError:
+        pass
+
+
+def _consume_webui_pause_cmd():
+    try:
+        with open(_WEBUI_PAUSE_CMD_FILE, "r", encoding="utf-8") as f:
+            cmd = f.read().strip().lower()
+    except Exception:
+        return None
+    try:
+        os.remove(_WEBUI_PAUSE_CMD_FILE)
+    except OSError:
+        pass
+    return cmd or None
+
+
+def webui_pause_watcher_thread(stop_event, pause_event):
+    """Windows: 透過命令檔案接收 WebUI 暫停/繼續，避免 CTRL_BREAK 誤觸結束流程。"""
+    while not stop_event.is_set():
+        cmd = _consume_webui_pause_cmd()
+        if cmd == "pause":
+            _apply_pause_state(pause_event, True)
+        elif cmd == "resume":
+            _apply_pause_state(pause_event, False)
+        elif cmd == "toggle":
+            _toggle_pause_state(pause_event)
+        elif cmd == "stop":
+            # 優先走主流程的 stop_event 收尾，避免直接 SIGINT 造成非預期退出碼。
+            try:
+                _webui_send({"type": "progress", "stage": "正在停止", "detail": "收到 WebUI stop"})
+            except Exception:
+                pass
+            try:
+                if pause_event is not None:
+                    pause_event.clear()
+            except Exception:
+                pass
+            stop_event.set()
+        stop_event.wait(0.1)
 
 
 def _handle_sigusr1(signum, frame):
     """SIGUSR1：WebUI 暫停/繼續 toggle"""
     if _webui_pause_event is not None:
-        if _webui_pause_event.is_set():
-            _webui_pause_event.clear()
-        else:
-            _webui_pause_event.set()
+        _toggle_pause_state(_webui_pause_event)
 
 
-if not IS_WINDOWS and hasattr(signal, "SIGUSR1"):
+if IS_WINDOWS and hasattr(signal, "SIGBREAK"):
+    signal.signal(signal.SIGBREAK, _handle_sigusr1)
+elif hasattr(signal, "SIGUSR1"):
     signal.signal(signal.SIGUSR1, _handle_sigusr1)
 
 # ─── WebUI Event System ──────────────────────────────────────────
@@ -796,20 +846,6 @@ if not IS_WINDOWS and hasattr(signal, "SIGUSR1"):
 # 不啟用時 _webui_send() 是 no-op，零效能影響
 _webui_queue = None  # queue.Queue，啟用時才建立
 _WEBUI_PORT = 19780
-
-
-def _webui_send_realtime_results(log_path=None, rec_paths=None):
-    """即時模式停止時，送出結果檔案清單給 WebUI"""
-    files = []
-    if log_path and os.path.isfile(log_path):
-        rel = os.path.relpath(log_path, os.path.dirname(os.path.abspath(__file__)))
-        files.append({"name": os.path.basename(log_path), "path": rel})
-    for rp in (rec_paths or []):
-        if rp and os.path.isfile(rp):
-            rel = os.path.relpath(rp, os.path.dirname(os.path.abspath(__file__)))
-            files.append({"name": os.path.basename(rp), "path": rel})
-    if files:
-        _webui_send({"type": "output_files", "files": files, "dirs": []})
 
 
 _subtitle_forwarder = None  # SubtitleForwarder 實例（啟用時才建立）
@@ -3974,6 +4010,7 @@ def _input_interactive_menu(args):
 def run_stream(capture_id: int, translator, model_name: str, model_path: str,
                length_ms: int = 5000, step_ms: int = 3000, mode: str = "en2zh",
                record: bool = False, rec_device: int = None,
+               record_video: bool = False, video_device: str = None,
                meeting_topic: str = None):
     """啟動 whisper-stream 子程序並即時翻譯輸出"""
 
@@ -4006,6 +4043,14 @@ def run_stream(capture_id: int, translator, model_name: str, model_path: str,
     rec_stream = None
     _rec_stream_mic = None   # Windows 混合錄音的麥克風串流
     _mixer = None            # Windows 混合錄音的 mixer
+    video_recorder = None
+    if record_video:
+        try:
+            video_recorder = _VideoRecorder(topic=meeting_topic, camera_name=video_device)
+            print(f"  {C_DIM}錄影: {video_recorder.path}{RESET}")
+        except Exception as e:
+            print(f"{C_HIGHLIGHT}[警告] 無法啟動影片錄製: {e}{RESET}")
+            video_recorder = None
     if record:
         import sounddevice as sd
         import numpy as np
@@ -4123,6 +4168,7 @@ def run_stream(capture_id: int, translator, model_name: str, model_path: str,
     stop_keypress = threading.Event()
     pause_event = threading.Event()
     global _webui_pause_event; _webui_pause_event = pause_event
+    _clear_webui_pause_cmd_file()
     setup_terminal_raw_input()
     kp_thread = threading.Thread(
         target=keypress_listener_thread,
@@ -4131,17 +4177,30 @@ def run_stream(capture_id: int, translator, model_name: str, model_path: str,
         daemon=True,
     )
     kp_thread.start()
+    if IS_WINDOWS:
+        threading.Thread(target=webui_pause_watcher_thread,
+                         args=(stop_keypress, pause_event),
+                         daemon=True).start()
 
     # 被動音量監控（稍後初始化，signal_handler 透過閉包取得）
     audio_monitor = None
 
     # 設定 signal handler
     _sigint_count_ws = [0]
+    _cleanup_in_progress_ws = [False]
+    _cleanup_started_at_ws = [0.0]
 
     def signal_handler(signum, frame):
+        now = time.monotonic()
         _sigint_count_ws[0] += 1
-        if _sigint_count_ws[0] >= 2:
+        print(f"\n{C_DIM}[DEBUG] 收到停止訊號 {signum}（第 {_sigint_count_ws[0]} 次）{RESET}", flush=True)
+        if _cleanup_in_progress_ws[0]:
+            if now - _cleanup_started_at_ws[0] < 25:
+                print(f"\n{C_DIM}正在收尾與合併中，請稍候...{RESET}", flush=True)
+                return
             _force_exit(1)
+        _cleanup_in_progress_ws[0] = True
+        _cleanup_started_at_ws[0] = now
         clear_status_bar()
         restore_terminal()
         stop_keypress.set()
@@ -4161,11 +4220,17 @@ def run_stream(capture_id: int, translator, model_name: str, model_path: str,
                 pass
         if _mixer:
             _mixer.flush_remaining()
+        final_audio_path = None
         if recorder:
-            rec_path = recorder.close()
-            print(f"\n  {C_OK}✓ 錄音已儲存: {rec_path}{RESET}", flush=True)
+            final_audio_path = recorder.close()
+            print(f"\n  {C_OK}✓ 錄音已儲存: {final_audio_path}{RESET}", flush=True)
             print(f"  {C_DIM}提示: 可再次執行本程式，選擇「讀入檔案」匯入錄音檔，產生逐字稿校正與 AI 摘要{RESET}", flush=True)
-            _webui_send_realtime_results(log_path, [rec_path])
+        if video_recorder:
+            try:
+                video_path = video_recorder.finalize(final_audio_path)
+                print(f"\n  {C_OK}✓ 錄影已儲存: {video_path}{RESET}", flush=True)
+            except Exception as e:
+                print(f"\n{C_HIGHLIGHT}[警告] 影片錄製或合併失敗: {e}{RESET}", flush=True)
         print(f"\n{C_DIM}正在停止...{RESET}", flush=True)
         _webui_send({"type": "progress", "stage": "正在停止", "detail": ""})
         proc.terminate()
@@ -4500,7 +4565,6 @@ def run_stream(capture_id: int, translator, model_name: str, model_path: str,
     if recorder:
         rec_path = recorder.close()
         print(f"\n  {C_OK}✓ 錄音已儲存: {rec_path}{RESET}", flush=True)
-        _webui_send_realtime_results(log_path, [rec_path])
 
     # 清理暫存檔
     if os.path.exists(output_file):
@@ -4556,6 +4620,7 @@ def run_stream_moonshine(capture_id: int, translator, moonshine_model_name: str,
     stop_event = threading.Event()
     pause_event = threading.Event()
     global _webui_pause_event; _webui_pause_event = pause_event
+    _clear_webui_pause_cmd_file()
     setup_terminal_raw_input()
     kp_thread = threading.Thread(
         target=keypress_listener_thread,
@@ -4564,6 +4629,10 @@ def run_stream_moonshine(capture_id: int, translator, moonshine_model_name: str,
         daemon=True,
     )
     kp_thread.start()
+    if IS_WINDOWS:
+        threading.Thread(target=webui_pause_watcher_thread,
+                         args=(stop_event, pause_event),
+                         daemon=True).start()
 
     # 非同步翻譯（有序輸出）
     print_lock = threading.Lock()
@@ -4875,15 +4944,23 @@ def run_stream_moonshine(capture_id: int, translator, moonshine_model_name: str,
             rec_path = recorder.close()
             print(f"\n  {C_OK}✓ 錄音已儲存: {rec_path}{RESET}", flush=True)
             print(f"  {C_DIM}提示: 可再次執行本程式，選擇「讀入檔案」匯入錄音檔，產生逐字稿校正與 AI 摘要{RESET}", flush=True)
-            _webui_send_realtime_results(log_path, [rec_path])
 
     # Signal handler
     _sigint_count_ms = [0]
+    _cleanup_in_progress_ms = [False]
+    _cleanup_started_at_ms = [0.0]
 
     def signal_handler(signum, frame):
+        now = time.monotonic()
         _sigint_count_ms[0] += 1
-        if _sigint_count_ms[0] >= 2:
+        print(f"\n{C_DIM}[DEBUG] 收到停止訊號 {signum}（第 {_sigint_count_ms[0]} 次）{RESET}", flush=True)
+        if _cleanup_in_progress_ms[0]:
+            if now - _cleanup_started_at_ms[0] < 25:
+                print(f"\n{C_DIM}正在收尾與合併中，請稍候...{RESET}", flush=True)
+                return
             _force_exit(1)
+        _cleanup_in_progress_ms[0] = True
+        _cleanup_started_at_ms[0] = now
         clear_status_bar()
         restore_terminal()
         _cleanup_moonshine()
@@ -4937,6 +5014,7 @@ def run_stream_remote(capture_id: int, translator, model_name: str,
                       remote_cfg: dict, mode: str = "en2zh",
                       length_ms: int = 5000, step_ms: int = 3000,
                       record: bool = False, rec_device: int = None,
+                      record_video: bool = False, video_device: str = None,
                       force_restart: bool = False,
                       meeting_topic: str = None,
                       denoise: bool = False):
@@ -5023,6 +5101,14 @@ def run_stream_remote(capture_id: int, translator, model_name: str,
     rec_stream = None
     _rec_stream_mic = None   # Windows 混合錄音的麥克風串流
     _mixer = None            # Windows 混合錄音的 mixer
+    video_recorder = None
+    if record_video:
+        try:
+            video_recorder = _VideoRecorder(topic=meeting_topic, camera_name=video_device)
+            print(f"  {C_DIM}錄影: {video_recorder.path}{RESET}")
+        except Exception as e:
+            print(f"{C_HIGHLIGHT}[警告] 無法啟動影片錄製: {e}{RESET}")
+            video_recorder = None
     if record:
         use_separate_rec = (rec_device is not None and rec_device != capture_id)
         if use_separate_rec:
@@ -5113,6 +5199,7 @@ def run_stream_remote(capture_id: int, translator, model_name: str,
 
     pause_event = threading.Event()
     global _webui_pause_event; _webui_pause_event = pause_event
+    _clear_webui_pause_cmd_file()
     print_lock = threading.Lock()
     setup_terminal_raw_input()
     kp_thread = threading.Thread(
@@ -5122,6 +5209,10 @@ def run_stream_remote(capture_id: int, translator, model_name: str,
         daemon=True,
     )
     kp_thread.start()
+    if IS_WINDOWS:
+        threading.Thread(target=webui_pause_watcher_thread,
+                         args=(stop_event, pause_event),
+                         daemon=True).start()
 
     # ── sounddevice callback ──
     def audio_callback(indata, frames, time_info, status):
@@ -5359,6 +5450,7 @@ def run_stream_remote(capture_id: int, translator, model_name: str,
             return
         _cleaned_up[0] = True
         stop_event.set()
+        print(f"{C_DIM}[DEBUG] 進入 remote cleanup{RESET}", flush=True)
         if _rec_stream_mic:
             try:
                 _rec_stream_mic.stop()
@@ -5378,20 +5470,36 @@ def run_stream_remote(capture_id: int, translator, model_name: str,
             pass
         if _mixer:
             _mixer.flush_remaining()
+        final_audio_path = None
         if recorder:
-            rec_path = recorder.close()
-            print(f"\n  {C_OK}✓ 錄音已儲存: {rec_path}{RESET}", flush=True)
+            final_audio_path = recorder.close()
+            print(f"\n  {C_OK}✓ 錄音已儲存: {final_audio_path}{RESET}", flush=True)
             print(f"  {C_DIM}提示: 可再次執行本程式，選擇「讀入檔案」匯入錄音檔，產生逐字稿校正與 AI 摘要{RESET}", flush=True)
-            _webui_send_realtime_results(log_path, [rec_path])
+        if video_recorder:
+            try:
+                print(f"{C_DIM}[DEBUG] remote cleanup: 開始 finalize video{RESET}", flush=True)
+                video_path = video_recorder.finalize(final_audio_path)
+                print(f"\n  {C_OK}✓ 錄影已儲存: {video_path}{RESET}", flush=True)
+            except Exception as e:
+                print(f"\n{C_HIGHLIGHT}[警告] 影片錄製或合併失敗: {e}{RESET}", flush=True)
         # 伺服器保持執行（不停止，允許多實例共用）
         _ssh_close_cm(remote_cfg)
 
     _sigint_count_rm = [0]
+    _cleanup_in_progress_rm = [False]
+    _cleanup_started_at_rm = [0.0]
 
     def signal_handler(signum, frame):
+        now = time.monotonic()
         _sigint_count_rm[0] += 1
-        if _sigint_count_rm[0] >= 2:
+        print(f"\n{C_DIM}[DEBUG] 收到停止訊號 {signum}（第 {_sigint_count_rm[0]} 次）{RESET}", flush=True)
+        if _cleanup_in_progress_rm[0]:
+            if now - _cleanup_started_at_rm[0] < 25:
+                print(f"\n{C_DIM}正在收尾與合併中，請稍候...{RESET}", flush=True)
+                return
             _force_exit(1)
+        _cleanup_in_progress_rm[0] = True
+        _cleanup_started_at_rm[0] = now
         clear_status_bar()
         restore_terminal()
         _cleanup_remote()
@@ -5496,6 +5604,7 @@ def run_stream_local_whisper(capture_id: int, translator, model_name: str,
                              mode: str = "en2zh",
                              length_ms: int = 5000, step_ms: int = 3000,
                              record: bool = False, rec_device: int = None,
+                             record_video: bool = False, video_device: str = None,
                              meeting_topic: str = None,
                              denoise: bool = False):
     """Windows 專用：sounddevice/WASAPI 擷取音訊 → 本機 faster-whisper 即時辨識。
@@ -5567,7 +5676,7 @@ def run_stream_local_whisper(capture_id: int, translator, model_name: str,
     with warnings.catch_warnings():
         warnings.filterwarnings("ignore", category=UserWarning)
         warnings.filterwarnings("ignore", category=FutureWarning)
-        fw_model = _call_with_ssl_retry(WhisperModel, model_name, device="auto", compute_type="int8")
+        fw_model = _call_with_ssl_retry(WhisperModel, model_name, device="auto", compute_type="float16")
     _hf_logger.setLevel(_hf_log_level)
     if _fw_need_download:
         print(f"  {C_OK}模型下載完成（{time.monotonic() - t0:.1f}s）{RESET}")
@@ -5592,6 +5701,14 @@ def run_stream_local_whisper(capture_id: int, translator, model_name: str,
     rec_stream = None
     _rec_stream_mic = None   # Windows 混合錄音的麥克風串流
     _mixer = None            # Windows 混合錄音的 mixer
+    video_recorder = None
+    if record_video:
+        try:
+            video_recorder = _VideoRecorder(topic=meeting_topic, camera_name=video_device)
+            print(f"  {C_DIM}錄影: {video_recorder.path}{RESET}")
+        except Exception as e:
+            print(f"{C_HIGHLIGHT}[警告] 無法啟動影片錄製: {e}{RESET}")
+            video_recorder = None
     if record:
         use_separate_rec = (rec_device is not None and rec_device != capture_id)
         if use_separate_rec:
@@ -5683,6 +5800,7 @@ def run_stream_local_whisper(capture_id: int, translator, model_name: str,
 
     pause_event = threading.Event()
     global _webui_pause_event; _webui_pause_event = pause_event
+    _clear_webui_pause_cmd_file()
     print_lock = threading.Lock()
     setup_terminal_raw_input()
     kp_thread = threading.Thread(
@@ -5692,6 +5810,10 @@ def run_stream_local_whisper(capture_id: int, translator, model_name: str,
         daemon=True,
     )
     kp_thread.start()
+    if IS_WINDOWS:
+        threading.Thread(target=webui_pause_watcher_thread,
+                         args=(stop_event, pause_event),
+                         daemon=True).start()
 
     # ── sounddevice callback（存原始取樣率，不降採樣）──
     def audio_callback(indata, frames, time_info, status):
@@ -5952,6 +6074,7 @@ def run_stream_local_whisper(capture_id: int, translator, model_name: str,
             return
         _cleaned_up[0] = True
         stop_event.set()
+        print(f"{C_DIM}[DEBUG] 進入 local cleanup{RESET}", flush=True)
         if _rec_stream_mic:
             try:
                 _rec_stream_mic.stop()
@@ -5971,18 +6094,34 @@ def run_stream_local_whisper(capture_id: int, translator, model_name: str,
             pass
         if _mixer:
             _mixer.flush_remaining()
+        final_audio_path = None
         if recorder:
-            rec_path = recorder.close()
-            print(f"\n  {C_OK}錄音已儲存: {rec_path}{RESET}", flush=True)
+            final_audio_path = recorder.close()
+            print(f"\n  {C_OK}錄音已儲存: {final_audio_path}{RESET}", flush=True)
             print(f"  {C_DIM}提示: 可再次執行本程式，選擇「讀入檔案」匯入錄音檔，產生逐字稿校正與 AI 摘要{RESET}", flush=True)
-            _webui_send_realtime_results(log_path, [rec_path])
+        if video_recorder:
+            try:
+                print(f"{C_DIM}[DEBUG] local cleanup: 開始 finalize video{RESET}", flush=True)
+                video_path = video_recorder.finalize(final_audio_path)
+                print(f"\n  {C_OK}錄影已儲存: {video_path}{RESET}", flush=True)
+            except Exception as e:
+                print(f"\n{C_HIGHLIGHT}[警告] 影片錄製或合併失敗: {e}{RESET}", flush=True)
 
     _sigint_count_lc = [0]
+    _cleanup_in_progress_lc = [False]
+    _cleanup_started_at_lc = [0.0]
 
     def signal_handler(signum, frame):
+        now = time.monotonic()
         _sigint_count_lc[0] += 1
-        if _sigint_count_lc[0] >= 2:
+        print(f"\n{C_DIM}[DEBUG] 收到停止訊號 {signum}（第 {_sigint_count_lc[0]} 次）{RESET}", flush=True)
+        if _cleanup_in_progress_lc[0]:
+            if now - _cleanup_started_at_lc[0] < 25:
+                print(f"\n{C_DIM}正在收尾與合併中，請稍候...{RESET}", flush=True)
+                return
             _force_exit(1)
+        _cleanup_in_progress_lc[0] = True
+        _cleanup_started_at_lc[0] = now
         clear_status_bar()
         restore_terminal()
         _cleanup_local()
@@ -6095,11 +6234,11 @@ def run_stream_bidirectional(lb_device_id, mic_device_id,
                               model_name: str, mode: str = "en_zh",
                               length_ms: int = 5000, step_ms: int = 3000,
                               record: bool = False,
+                              record_video: bool = False, video_device: str = None,
                               meeting_topic: str = None,
                               use_mlx: bool = False,
                               mic_translate: bool = True,
-                              denoise: bool = False,
-                              mic_remote_cfg: dict = None):
+                              denoise: bool = False):
     """雙向即時翻譯：兩路音訊串流 → 共用 faster-whisper/mlx-whisper → 各自翻譯 → 交錯輸出。
     lb_device_id: 系統音訊（BlackHole / WASAPI Loopback）
     mic_device_id: 麥克風
@@ -6328,7 +6467,8 @@ def run_stream_bidirectional(lb_device_id, mic_device_id,
         with warnings.catch_warnings():
             warnings.filterwarnings("ignore", category=UserWarning)
             warnings.filterwarnings("ignore", category=FutureWarning)
-            fw_model = _call_with_ssl_retry(WhisperModel, model_name, device="auto", compute_type="int8")
+            #fw_model = _call_with_ssl_retry(WhisperModel, model_name, device="auto", compute_type="int8")
+            fw_model = _call_with_ssl_retry(WhisperModel, model_name, device="auto", compute_type="float16")
         _hf_logger.setLevel(_hf_log_level)
         if _fw_need_download:
             print(f"  {C_OK}模型下載完成（{time.monotonic() - t0:.1f}s）{RESET}")
@@ -6358,6 +6498,14 @@ def run_stream_bidirectional(lb_device_id, mic_device_id,
     # ── 錄音（兩個獨立錄音器）──
     recorder_lb = None
     recorder_mic = None
+    video_recorder = None
+    if record_video:
+        try:
+            video_recorder = _VideoRecorder(topic=meeting_topic, camera_name=video_device)
+            print(f"  {C_DIM}錄影: {video_recorder.path}{RESET}")
+        except Exception as e:
+            print(f"{C_HIGHLIGHT}[警告] 無法啟動影片錄製: {e}{RESET}")
+            video_recorder = None
     if record:
         recorder_lb = _AudioRecorder(lb_sr, topic=f"{meeting_topic or ''}_系統音訊".lstrip("_"), mode=mode)
         recorder_mic = _AudioRecorder(mic_sr, topic=f"{meeting_topic or ''}_麥克風".lstrip("_"), mode=mode)
@@ -6430,6 +6578,7 @@ def run_stream_bidirectional(lb_device_id, mic_device_id,
 
     pause_event = threading.Event()
     global _webui_pause_event; _webui_pause_event = pause_event
+    _clear_webui_pause_cmd_file()
     print_lock = threading.Lock()
     setup_terminal_raw_input()
     kp_thread = threading.Thread(
@@ -6439,6 +6588,10 @@ def run_stream_bidirectional(lb_device_id, mic_device_id,
         daemon=True,
     )
     kp_thread.start()
+    if IS_WINDOWS:
+        threading.Thread(target=webui_pause_watcher_thread,
+                         args=(stop_event, pause_event),
+                         daemon=True).start()
 
     # ── Loopback 音訊 callback ──
     # WebUI 靜音 flag 檔案
@@ -6507,11 +6660,10 @@ def run_stream_bidirectional(lb_device_id, mic_device_id,
             blocksize=int(lb_sr * 0.1), dtype="float32",
             callback=lb_audio_callback)
 
-    # 注意：mic_stream 故意延後到 lb_stream.start() 之後才建立。
-    # macOS CoreAudio 若同時預先建立兩個 InputStream（BlackHole + 內建麥克風），
-    # 第二個 stream.start() 會偶發 PaErrorCode -9986 (paInternalError)。
-    # 改為「先 start lb，再建立並 start mic」可穩定避開。
-    mic_stream = None
+    mic_stream = sd.InputStream(
+        device=mic_device_id, samplerate=mic_sr, channels=mic_ch,
+        blocksize=int(mic_sr * 0.1), dtype="float32",
+        callback=mic_audio_callback)
 
     # ── 降噪 ──
     if denoise:
@@ -6926,7 +7078,7 @@ def run_stream_bidirectional(lb_device_id, mic_device_id,
 
     _slow_warned = [False]
 
-    def transcribe_chunk(seq, wav_path, lang, pending_res, res_lock, use_remote=False):
+    def transcribe_chunk(seq, wav_path, lang, pending_res, res_lock):
         with _active_lock:
             _active_transcriptions[0] += 1
         try:
@@ -6934,24 +7086,6 @@ def run_stream_bidirectional(lb_device_id, mic_device_id,
                 with res_lock:
                     pending_res[seq] = _TRANSCRIBE_FAILED
                 return
-
-            # 遠端 GPU 伺服器辨識（麥克風）
-            if use_remote and mic_remote_cfg:
-                try:
-                    _rl = lang or ("zh" if mode in ("zh", "zh2en", "zh2ja", "en_zh", "ja_zh") else "en")
-                    with open(wav_path, "rb") as _rf:
-                        _wav_bytes = _rf.read()
-                    _segs, _full, _pt = _remote_whisper_transcribe_bytes(
-                        mic_remote_cfg, _wav_bytes, model_name, _rl, timeout=30)
-                    with res_lock:
-                        pending_res[seq] = (_segs, _full, _pt, _rl)
-                    return
-                except Exception as _re:
-                    # 遠端失敗 → 降級本機辨識
-                    with print_lock:
-                        print(f"{C_DIM}  [麥克風遠端辨識失敗，降級本機: {_re}]{RESET}", flush=True)
-
-            # 本機辨識（mlx / faster-whisper）
             # 序列化鎖：Metal GPU 不允許並行 command buffer（會 crash）
             # 超時 = step_sec：等太久不如放棄，下一個 chunk 有更新的音訊
             if not _serial_lock.acquire(timeout=step_sec):
@@ -7087,6 +7221,7 @@ def run_stream_bidirectional(lb_device_id, mic_device_id,
             return
         _cleaned_up[0] = True
         stop_event.set()
+        print(f"{C_DIM}[DEBUG] 進入 bidi cleanup{RESET}", flush=True)
         # 等待進行中的辨識完成，避免 MLX Metal mutex 崩潰
         _still_active = False
         for _w in range(20):  # 最多等 2 秒（os._exit 會強制結束，不需等太久）
@@ -7114,18 +7249,34 @@ def run_stream_bidirectional(lb_device_id, mic_device_id,
         if recorder_mic:
             p2 = recorder_mic.close()
             print(f"  {C_OK}錄音已儲存: {p2}{RESET}", flush=True)
+        if video_recorder:
+            try:
+                print(f"{C_DIM}[DEBUG] bidi cleanup: 開始 finalize video{RESET}", flush=True)
+                audio_path = recorder_lb.path if recorder_lb else None
+                video_path = video_recorder.finalize(audio_path)
+                print(f"  {C_OK}錄影已儲存: {video_path}{RESET}", flush=True)
+            except Exception as e:
+                print(f"  {C_HIGHLIGHT}[警告] 影片錄製或合併失敗: {e}{RESET}", flush=True)
         if recorder_lb or recorder_mic:
             print(f"  {C_DIM}提示: 可再次執行本程式，選擇「讀入檔案」匯入錄音檔，產生逐字稿校正與 AI 摘要{RESET}", flush=True)
-            _webui_send_realtime_results(log_path, [p1 if recorder_lb else None, p2 if recorder_mic else None])
         return _still_active
 
     _sigint_count = [0]
+    _cleanup_in_progress = [False]
+    _cleanup_started_at = [0.0]
 
     def signal_handler(signum, frame):
+        now = time.monotonic()
         _sigint_count[0] += 1
-        if _sigint_count[0] >= 2:
-            # 第二次 Ctrl+C：強制結束，跳過所有清理
+        print(f"\n{C_DIM}[DEBUG] 收到停止訊號 {signum}（第 {_sigint_count[0]} 次）{RESET}", flush=True)
+        if _cleanup_in_progress[0]:
+            # 收尾期間忽略重複停止，避免中斷 finalize 導致 mkv 殘留。
+            if now - _cleanup_started_at[0] < 25:
+                print(f"\n{C_DIM}正在收尾與合併中，請稍候...{RESET}", flush=True)
+                return
             _force_exit(1)
+        _cleanup_in_progress[0] = True
+        _cleanup_started_at[0] = now
         clear_status_bar()
         restore_terminal()
         _cleanup_bidi()
@@ -7138,44 +7289,8 @@ def run_stream_bidirectional(lb_device_id, mic_device_id,
     signal.signal(signal.SIGTERM, signal_handler)
 
     # ── 啟動音訊串流 ──
-    # 先啟動 lb_stream，再「建立並啟動」mic_stream（macOS 必要的順序，見上方說明）
     lb_stream.start()
-
-    def _open_mic_stream(**extra):
-        return sd.InputStream(
-            device=mic_device_id, samplerate=mic_sr, channels=mic_ch,
-            dtype="float32", callback=mic_audio_callback, **extra)
-
-    _mic_attempts = [
-        ("blocksize=int(mic_sr*0.1)", dict(blocksize=int(mic_sr * 0.1))),
-        ("blocksize=0, latency=high", dict(blocksize=0, latency='high')),
-        ("blocksize=int(mic_sr*0.1), latency=high", dict(blocksize=int(mic_sr * 0.1), latency='high')),
-    ]
-    _mic_started = False
-    _last_err = None
-    for _label, _kw in _mic_attempts:
-        try:
-            mic_stream = _open_mic_stream(**_kw)
-            mic_stream.start()
-            _mic_started = True
-            break
-        except Exception as _e:
-            _last_err = _e
-            try:
-                if mic_stream is not None:
-                    mic_stream.close()
-            except Exception:
-                pass
-            mic_stream = None
-            print(f"  {C_DIM}麥克風串流嘗試（{_label}）失敗：{_e}{RESET}", flush=True)
-    if not _mic_started:
-        try:
-            lb_stream.stop(); lb_stream.close()
-        except Exception:
-            pass
-        print(f"  {C_HIGHLIGHT}[錯誤] 麥克風串流所有重試方案均失敗：{_last_err}{RESET}", flush=True)
-        print(f"  {C_DIM}建議：1) 確認麥克風未被其他程式佔用 2) 系統設定→隱私權與安全性→麥克風 確認 Terminal/Python 已授權 3) 重啟 CoreAudio：sudo killall coreaudiod{RESET}", flush=True)
-        raise _last_err
+    mic_stream.start()
 
     # ── 驗證音訊 ──
     _audio_ok = [False, False]  # [lb, mic]
@@ -7246,10 +7361,9 @@ def run_stream_bidirectional(lb_device_id, mic_device_id,
                         _last_lb_rms = rms
                         if rms >= 0.001:
                             seq = lb_transcribe_seq[0]; lb_transcribe_seq[0] += 1
-                            _lb_use_remote = bool(mic_remote_cfg)
                             threading.Thread(
                                 target=transcribe_chunk,
-                                args=(seq, wav_path, lb_lang, lb_pending_results, lb_results_lock, _lb_use_remote),
+                                args=(seq, wav_path, lb_lang, lb_pending_results, lb_results_lock),
                                 daemon=True,
                             ).start()
                         else:
@@ -7279,10 +7393,9 @@ def run_stream_bidirectional(lb_device_id, mic_device_id,
                             _mic_rms_threshold = max(_mic_rms_threshold, 0.015)
                         if rms >= _mic_rms_threshold:
                             seq = mic_transcribe_seq[0]; mic_transcribe_seq[0] += 1
-                            _mic_use_remote = bool(mic_remote_cfg)
                             threading.Thread(
                                 target=transcribe_chunk,
-                                args=(seq, wav_path, mic_lang, mic_pending_results, mic_results_lock, _mic_use_remote),
+                                args=(seq, wav_path, mic_lang, mic_pending_results, mic_results_lock),
                                 daemon=True,
                             ).start()
                         else:
@@ -7573,6 +7686,307 @@ class _AudioRecorder:
             pass
         self._convert()
         return self.path
+
+
+class _VideoRecorder:
+    """錄製螢幕與攝影機畫面，暫停時切分片段，結束後合併成 MP4。"""
+
+    def __init__(self, topic=None, camera_name=None, framerate=15):
+        import datetime as _datetime
+        import shutil as _shutil
+
+        self._ffmpeg = _shutil.which("ffmpeg")
+        if not self._ffmpeg:
+            raise RuntimeError("找不到 ffmpeg，無法錄製影片")
+
+        os.makedirs(RECORDING_DIR, exist_ok=True)
+        topic_part = _topic_to_filename_part(topic)
+        self.path = _datetime.datetime.now().strftime(f"錄影{topic_part}_%Y%m%d_%H%M%S.mp4")
+        self.path = os.path.join(RECORDING_DIR, self.path)
+        self._tmp_base = os.path.splitext(self.path)[0] + "_tmp"
+        self._camera_name = camera_name or self._detect_default_camera()
+        self._framerate = framerate
+        self._seg_paths = []
+        self._all_seg_paths = []
+        self._seg_idx = 0
+        self._current_seg_path = None
+        self._paused = False
+        self._ctrl_lock = threading.Lock()
+        self._proc = None
+        self._start_new_segment()
+        _set_active_video_recorder(self)
+
+    def _detect_default_camera(self):
+        if not IS_WINDOWS:
+            return None
+        cmd = [self._ffmpeg, "-hide_banner", "-loglevel", "error",
+               "-list_devices", "true", "-f", "dshow", "-i", "dummy"]
+        try:
+            proc = subprocess.run(cmd, capture_output=True, text=True, **_SUBPROCESS_FLAGS)
+            lines = proc.stderr.splitlines()
+        except Exception:
+            return None
+
+        video_devices = []
+        in_video = False
+        for line in lines:
+            if "DirectShow video devices" in line:
+                in_video = True
+                continue
+            if "DirectShow audio devices" in line:
+                in_video = False
+                continue
+            if in_video and "\"" in line:
+                name = line.strip().strip('"')
+                if name:
+                    video_devices.append(name)
+        return video_devices[0] if video_devices else None
+
+    def _next_seg_path(self):
+        p = f"{self._tmp_base}_seg{self._seg_idx:04d}.mkv"
+        self._seg_idx += 1
+        self._all_seg_paths.append(p)
+        return p
+
+    def _start_ffmpeg(self, out_path):
+        cmd = [self._ffmpeg, "-y", "-hide_banner", "-loglevel", "error"]
+        cmd += ["-f", "gdigrab", "-framerate", str(self._framerate), "-i", "desktop"]
+
+        if self._camera_name:
+            cmd += ["-f", "dshow", "-i", f"video={self._camera_name}"]
+            filter_complex = (
+                "[1:v]scale=320:-1[cam];"
+                "[0:v][cam]overlay=W-w-10:H-h-10[out]"
+            )
+            cmd += ["-filter_complex", filter_complex, "-map", "[out]"]
+
+        cmd += ["-c:v", "libx264", "-preset", "ultrafast", "-crf", "23",
+                "-pix_fmt", "yuv420p", "-r", str(self._framerate),
+                out_path]
+        try:
+            return subprocess.Popen(
+                cmd,
+                stdin=subprocess.PIPE,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                **_SUBPROCESS_FLAGS,
+            )
+        except Exception as e:
+            raise RuntimeError(f"無法啟動 ffmpeg 錄影: {e}")
+
+    def _start_new_segment(self):
+        self._current_seg_path = self._next_seg_path()
+        self._proc = self._start_ffmpeg(self._current_seg_path)
+
+    def _stop_current_segment(self):
+        if self._proc is None:
+            return
+        try:
+            if self._proc.poll() is None:
+                # 優雅要求 ffmpeg 結束，避免 Windows terminate 導致容器檔未寫完。
+                sent_quit = False
+                try:
+                    if self._proc.stdin:
+                        try:
+                            self._proc.stdin.write(b"q\n")
+                        except TypeError:
+                            self._proc.stdin.write("q\n")
+                        self._proc.stdin.flush()
+                        sent_quit = True
+                except Exception:
+                    sent_quit = False
+
+                if sent_quit:
+                    try:
+                        if self._proc.stdin:
+                            self._proc.stdin.close()
+                    except Exception:
+                        pass
+                    self._proc.wait(timeout=20)
+                else:
+                    self._proc.terminate()
+                    self._proc.wait(timeout=5)
+        except Exception:
+            try:
+                self._proc.kill()
+            except Exception:
+                pass
+        finally:
+            self._proc = None
+        if self._current_seg_path and os.path.exists(self._current_seg_path):
+            try:
+                if os.path.getsize(self._current_seg_path) > 0:
+                    self._seg_paths.append(self._current_seg_path)
+            except OSError:
+                pass
+        self._current_seg_path = None
+
+    def pause(self):
+        with self._ctrl_lock:
+            if self._paused:
+                return
+            self._stop_current_segment()
+            self._paused = True
+
+    def resume(self):
+        with self._ctrl_lock:
+            if not self._paused:
+                return
+            self._start_new_segment()
+            self._paused = False
+
+    def stop(self):
+        with self._ctrl_lock:
+            self._stop_current_segment()
+        _clear_active_video_recorder_if(self)
+
+    def _cleanup_temp_files(self, keep_paths=None):
+        keep = set([p for p in (keep_paths or []) if p])
+        temp_paths = set(self._all_seg_paths)
+        if self._current_seg_path:
+            temp_paths.add(self._current_seg_path)
+        for p in temp_paths:
+            if not p or p in keep:
+                continue
+            try:
+                if os.path.exists(p):
+                    os.remove(p)
+            except OSError:
+                pass
+
+    def finalize(self, audio_path=None):
+        self.stop()
+        valid_seg_paths = []
+        for p in self._seg_paths:
+            try:
+                if p and os.path.exists(p) and os.path.getsize(p) > 0:
+                    valid_seg_paths.append(p)
+            except OSError:
+                pass
+        self._seg_paths = valid_seg_paths
+
+        if not self._seg_paths:
+            raise RuntimeError("影片暫存檔不存在，錄影失敗")
+
+        print(f"  [DEBUG] 開始合併 {len(self._seg_paths)} 個影片片段...", flush=True)
+        for idx, p in enumerate(self._seg_paths, 1):
+            size_mb = os.path.getsize(p) / (1024*1024) if os.path.exists(p) else 0
+            print(f"  [DEBUG]   片段 {idx}: {os.path.basename(p)} ({size_mb:.1f} MB)", flush=True)
+
+        merged_path = self._seg_paths[0]
+        concat_list = None
+        merge_error = None
+        if len(self._seg_paths) > 1:
+            concat_list = f"{self._tmp_base}_concat.txt"
+            merged_path = f"{self._tmp_base}_merged.mkv"
+            try:
+                print(f"  [DEBUG] 嘗試使用 concat demuxer 合併...", flush=True)
+                with open(concat_list, "w", encoding="utf-8") as f:
+                    for p in self._seg_paths:
+                        norm = p.replace("\\", "/")
+                        f.write(f"file '{norm.replace("'", "'\\''")}'\n")
+                subprocess.run([self._ffmpeg, "-y", "-hide_banner", "-loglevel", "error",
+                                "-f", "concat", "-safe", "0", "-i", concat_list,
+                                "-c", "copy", merged_path],
+                               check=True, stdout=subprocess.PIPE,
+                               stderr=subprocess.PIPE, text=True, **_SUBPROCESS_FLAGS)
+                print(f"  [DEBUG] concat demuxer 成功", flush=True)
+            except Exception as e:
+                print(f"  [DEBUG] concat demuxer 失敗: {e}", flush=True)
+                # concat demuxer 在某些 Windows 路徑情況會失敗，改用 re-encode 串接全部片段。
+                try:
+                    print(f"  [DEBUG] 嘗試使用 re-encode concat filter 合併...", flush=True)
+                    recode_cmd = [self._ffmpeg, "-y", "-hide_banner", "-loglevel", "error"]
+                    for seg in self._seg_paths:
+                        recode_cmd += ["-i", seg]
+                    concat_inputs = "".join([f"[{i}:v]" for i in range(len(self._seg_paths))])
+                    recode_cmd += [
+                        "-filter_complex", f"{concat_inputs}concat=n={len(self._seg_paths)}:v=1:a=0[outv]",
+                        "-map", "[outv]",
+                        "-c:v", "libx264", "-preset", "veryfast", "-crf", "23",
+                        "-pix_fmt", "yuv420p", "-r", str(self._framerate),
+                        merged_path,
+                    ]
+                    subprocess.run(recode_cmd, check=True, stdout=subprocess.PIPE,
+                                       stderr=subprocess.PIPE, text=True, **_SUBPROCESS_FLAGS)
+                    print(f"  [DEBUG] re-encode concat filter 成功", flush=True)
+                except Exception as e:
+                    merge_error = e
+                    print(f"  [DEBUG] re-encode concat filter 也失敗: {e}", flush=True)
+                    # 保留 merged_path 供後續輸出流程明確失敗，不再靜默退回第一片段。
+
+        print(f"  [DEBUG] 準備輸出 MP4 到: {self.path}", flush=True)
+        cmd = [self._ffmpeg, "-y", "-hide_banner", "-loglevel", "error", "-i", merged_path]
+        if audio_path:
+            print(f"  [DEBUG] 使用音訊路徑: {audio_path}", flush=True)
+            cmd += ["-i", audio_path, "-map", "0:v", "-map", "1:a?",
+                    "-c:v", "copy", "-c:a", "aac", "-b:a", "192k", "-shortest", self.path]
+        else:
+            print(f"  [DEBUG] 無音訊，純視訊輸出", flush=True)
+            cmd += ["-c", "copy", self.path]
+
+        try:
+            print(f"  [DEBUG] 執行最終輸出命令...", flush=True)
+            result = subprocess.run(cmd, check=True, stdout=subprocess.PIPE,
+                           stderr=subprocess.PIPE, text=True, **_SUBPROCESS_FLAGS)
+            print(f"  [DEBUG] MP4 輸出成功", flush=True)
+            self._cleanup_temp_files()
+            if concat_list and os.path.exists(concat_list):
+                try:
+                    os.remove(concat_list)
+                except OSError:
+                    pass
+            if merged_path.endswith("_merged.mkv") and os.path.exists(merged_path):
+                try:
+                    os.remove(merged_path)
+                except OSError:
+                    pass
+            print(f"  [DEBUG] 臨時檔案已清理", flush=True)
+            return self.path
+        except Exception as e:
+            print(f"  [DEBUG] MP4 輸出失敗: {e}，嘗試備用方案...", flush=True)
+            # 盡力保證最終輸出 mp4：先嘗試無音訊 remux，失敗再轉碼。
+            try:
+                print(f"  [DEBUG]   備用方案 1: 無音訊 remux...", flush=True)
+                result = subprocess.run([
+                    self._ffmpeg, "-y", "-hide_banner", "-loglevel", "error",
+                    "-i", merged_path,
+                    "-c:v", "copy", "-an", self.path
+                ], check=True, stdout=subprocess.PIPE,
+                   stderr=subprocess.PIPE, text=True, **_SUBPROCESS_FLAGS)
+                print(f"  [DEBUG]   備用方案 1 成功", flush=True)
+                return self.path
+            except Exception as e2:
+                print(f"  [DEBUG]   備用方案 1 失敗: {e2}", flush=True)
+                try:
+                    print(f"  [DEBUG]   備用方案 2: 無音訊 re-encode...", flush=True)
+                    result = subprocess.run([
+                        self._ffmpeg, "-y", "-hide_banner", "-loglevel", "error",
+                        "-i", merged_path,
+                        "-c:v", "libx264", "-preset", "veryfast", "-crf", "23",
+                        "-pix_fmt", "yuv420p", "-an", self.path
+                    ], check=True, stdout=subprocess.PIPE,
+                       stderr=subprocess.PIPE, text=True, **_SUBPROCESS_FLAGS)
+                    print(f"  [DEBUG]   備用方案 2 成功", flush=True)
+                    return self.path
+                except Exception as e3:
+                    print(f"  [DEBUG]   備用方案 2 也失敗: {e3}", flush=True)
+                    pass
+            self._cleanup_temp_files()
+            if concat_list and os.path.exists(concat_list):
+                try:
+                    os.remove(concat_list)
+                except OSError:
+                    pass
+            if merged_path.endswith("_merged.mkv") and os.path.exists(merged_path):
+                try:
+                    os.remove(merged_path)
+                except OSError:
+                    pass
+            if merge_error:
+                raise RuntimeError(f"影片片段合併失敗: {merge_error}") from e
+            raise
+            return merged_path
 
 
 class _DualStreamMixer:
@@ -9124,25 +9538,15 @@ def _is_zh_hallucination(text):
     # 重複模式偵測 2：任何字元連續出現 6 次以上
     if re.search(r'(.)\1{5,}', _t):
         return True
-    # 重複模式偵測 3：任意位置 2-8 字元片段連續重複 4 次以上（如「有多少多少多少多少...」「prova prova prova...」）
-    if len(_t) >= 8 and re.search(r'(.{2,8})\1{3,}', _t):
+    # 重複模式偵測 3：任意位置 2-4 字元片段連續重複 4 次以上（如「有多少多少多少多少...」）
+    if len(_t) >= 8 and re.search(r'(.{2,4})\1{3,}', _t):
         return True
-    # 重複模式偵測 4：同一個單詞（含空格）重複出現 5 次以上
-    _words = _t.split()
-    if len(_words) >= 5:
-        from collections import Counter as _WC
-        _wc = _WC(_words)
-        _top_word, _top_count = _wc.most_common(1)[0]
-        if _top_count >= 5 and _top_count / len(_words) > 0.5:
-            return True
     # 太短的中文（去除標點後不到 2 個字）
     _stripped = re.sub(r'[^\u4e00-\u9fff\u3040-\u30ff]', '', _t)
-    if _stripped.startswith("字幕") and len(_stripped) <= 6:
-        return True
     if len(_stripped) < 2:
         return True
     # 簡體+繁體關鍵字都要檢查（faster-whisper 可能輸出簡體）
-    if any(kw in text for kw in (
+    return any(kw in text for kw in (
         # YouTube 用語
         "訂閱", "订阅", "歡迎訂閱", "欢迎订阅",
         "點贊", "点赞", "點讚", "按讚", "轉發", "转发", "打賞", "打赏",
@@ -9150,12 +9554,10 @@ def _is_zh_hallucination(text):
         "感謝收聽", "感谢收听", "感謝聆聽", "感谢聆听",
         "喜歡的話", "喜欢的话", "別忘了", "别忘了",
         # 字幕/翻譯歸屬（Amara.org 訓練資料殘留）
-        "字幕由", "字幕提供", "字幕by", "字幕BY",
-        "中文字幕", "繁體中文", "简体中文", "擁體中文",
-        "字幕志願", "字幕志愿", "字幕組", "字幕组",
+        "字幕由", "字幕提供", "字幕by", "字幕BY", "字幕志願", "字幕志愿", "字幕組", "字幕组",
         "字幕視聽", "字幕视听", "字幕製作", "字幕制作",
         "翻譯志願", "翻译志愿", "校對志願", "校对志愿",
-        "Amara", "amara", "Saya", "saya", "prova", "Prova",
+        "Amara", "amara",
         # 版權歸屬幻覺（僅短句時過濾，長句可能是真實討論）
         "版權所有", "版权所有",
         "初音ミク", "初音",
@@ -9163,10 +9565,9 @@ def _is_zh_hallucination(text):
         "獨播", "独播", "劇場", "剧场", "YoYo", "Television Series",
         "明鏡", "明镜", "新聞頻道", "新闻频道",
         "直播間", "直播间", "觀眾朋友", "观众朋友",
-    )):
-        return True
+    ))
     # 短句限定：音樂/版權歸屬幻覺（長句中出現這些詞可能是真實討論，不過濾）
-    if len(_stripped) <= 20:
+    if len(_stripped) <= 10:
         return any(kw in text for kw in (
             "詞曲", "词曲", "作詞", "作词", "作曲", "編曲", "编曲",
             "詞：", "词：", "曲：", "演唱", "原唱",
@@ -9738,7 +10139,7 @@ def process_audio_file(input_path, mode, translator, model_size="large-v3-turbo"
             return None, None, None
 
         print(f"  {C_WHITE}載入模型    {model_size}...{RESET}", end=" ", flush=True)
-        model = _call_with_ssl_retry(WhisperModel, model_size, device="auto", compute_type="int8")
+        model = _call_with_ssl_retry(WhisperModel, model_size, device="auto", compute_type="float16")
         print(f"{C_OK}✓{RESET}")
         print(f"  {C_WHITE}辨識中...{RESET}\n")
         _webui_send({"type": "progress", "stage": "辨識中", "detail": f"本機 {model_size}"})
@@ -10180,7 +10581,7 @@ def process_bidi_audio_files(lb_path, mic_path, mode, translator_lb, translator_
                 return []
 
             print(f"  {C_WHITE}{label} 載入模型 {model_size}...{RESET}", end=" ", flush=True)
-            model = _call_with_ssl_retry(WhisperModel, model_size, device="auto", compute_type="int8")
+            model = _call_with_ssl_retry(WhisperModel, model_size, device="auto", compute_type="float16")
             print(f"{C_OK}✓{RESET}")
 
             sbar = _SummaryStatusBar(model=model_size, task=f"{label} 辨識中", asr_location="本機").start()
@@ -10749,8 +11150,6 @@ def summarize_log_file(input_path, model, host, port, server_type="ollama",
             prompt = _summary_prompt(chunk, topic=topic, summary_mode=summary_mode)
             seg = call_ollama_raw(prompt, model, host, port, spinner=sbar, live_output=True,
                                   server_type=server_type)
-            seg = re.sub(r'<think>[\s\S]*?</think>', '', seg).strip()
-            seg = re.sub(r'<think>[\s\S]*', '', seg).strip()
             seg = S2TWP.convert(seg)
             segment_summaries.append(seg)
             print(f"  {C_OK}第 {i+1}/{len(chunks)} 段完成{RESET}", flush=True)
@@ -10839,8 +11238,6 @@ def summarize_log_file(input_path, model, host, port, server_type="ollama",
         _retry_result = call_ollama_raw(_retry_prompt, model, host, port, spinner=sbar_retry,
                                         live_output=True, server_type=server_type)
         sbar_retry.stop()
-        _retry_result = re.sub(r'<think>[\s\S]*?</think>', '', _retry_result).strip()
-        _retry_result = re.sub(r'<think>[\s\S]*', '', _retry_result).strip()
         _retry_result = S2TWP.convert(_retry_result)
         # 將重點摘要放在前面，校正逐字稿放在後面
         summary = _retry_result.rstrip() + "\n\n" + summary.lstrip()
@@ -10871,8 +11268,6 @@ def summarize_log_file(input_path, model, host, port, server_type="ollama",
         _tc_result = call_ollama_raw(_tc_prompt, model, host, port, spinner=sbar_tc,
                                       live_output=True, server_type=server_type)
         sbar_tc.stop()
-        _tc_result = re.sub(r'<think>[\s\S]*?</think>', '', _tc_result).strip()
-        _tc_result = re.sub(r'<think>[\s\S]*', '', _tc_result).strip()
         _tc_result = S2TWP.convert(_tc_result)
         summary = summary.rstrip() + "\n\n" + _tc_result.lstrip()
         print(f"  {C_OK}校正逐字稿已補上{RESET}")
@@ -10896,8 +11291,6 @@ def summarize_log_file(input_path, model, host, port, server_type="ollama",
                     _r_prompt = _summary_prompt(chunk, topic=topic, summary_mode=summary_mode)
                     _r_seg = call_ollama_raw(_r_prompt, model, host, port, spinner=sbar_r,
                                              live_output=False, server_type=server_type)
-                    _r_seg = re.sub(r'<think>[\s\S]*?</think>', '', _r_seg).strip()
-                    _r_seg = re.sub(r'<think>[\s\S]*', '', _r_seg).strip()
                     _r_segs.append(S2TWP.convert(_r_seg))
                 sbar_r.set_task(f"第 {ri} 次 - 合併")
                 _r_combined = "\n\n---\n\n".join(
@@ -10938,10 +11331,6 @@ def summarize_log_file(input_path, model, host, port, server_type="ollama",
     import re as _re_fmt
     summary = _re_fmt.sub(r'#{2,4}\s*(?:最終)?(?:重點)?摘要', '## 重點摘要', summary)
     summary = _re_fmt.sub(r'#{2,4}\s*(?:校正)?逐字稿', '## 校正逐字稿', summary)
-
-    # 移除 <think>...</think> 標籤（部分模型如 Qwen3 會自動思考）
-    summary = re.sub(r'<think>[\s\S]*?</think>', '', summary).strip()
-    summary = re.sub(r'<think>[\s\S]*', '', summary).strip()
 
     summary = S2TWP.convert(summary)
 
@@ -11779,12 +12168,7 @@ def keypress_listener_thread(stop_event, ctrl_s_event=None, pause_event=None):
                             msvcrt.getch()
                         continue
                     if ch == b'\x10' and pause_event is not None:  # Ctrl+P
-                        if pause_event.is_set():
-                            pause_event.clear()
-                            _status_bar_state["paused"] = False
-                        else:
-                            pause_event.set()
-                            _status_bar_state["paused"] = True
+                        _toggle_pause_state(pause_event)
                     if ch == b'\x13' and ctrl_s_event is not None:  # Ctrl+S
                         ctrl_s_event.set()
                 else:
@@ -11799,12 +12183,7 @@ def keypress_listener_thread(stop_event, ctrl_s_event=None, pause_event=None):
                 if rlist:
                     data = os.read(fd, 32)
                     if b'\x10' in data and pause_event is not None:  # Ctrl+P
-                        if pause_event.is_set():
-                            pause_event.clear()
-                            _status_bar_state["paused"] = False
-                        else:
-                            pause_event.set()
-                            _status_bar_state["paused"] = True
+                        _toggle_pause_state(pause_event)
                     if b'\x13' in data and ctrl_s_event is not None:  # Ctrl+S
                         ctrl_s_event.set()
             except Exception:
@@ -12239,6 +12618,12 @@ def parse_args():
         "--record", action="store_true",
         help="即時模式同時錄製音訊為 WAV 檔（存入 recordings/）")
     parser.add_argument(
+        "--record-video", action="store_true",
+        help="即時模式同時錄製螢幕與攝影機畫面為影片（存入 recordings/）")
+    parser.add_argument(
+        "--video-device", metavar="NAME",
+        help="攝影機裝置名稱（Windows dshow，用於錄影畫面附上外接攝影機）")
+    parser.add_argument(
         "--rec-device", type=int, metavar="ID",
         help="錄音裝置 ID (可與 ASR 裝置不同，例如聚集裝置可同時錄雙方聲音)")
     parser.add_argument(
@@ -12412,6 +12797,12 @@ def _build_cli_command(**kwargs):
     record = kwargs.get("record")
     if record:
         parts.append("--record")
+    record_video = kwargs.get("record_video")
+    if record_video:
+        parts.append("--record-video")
+    video_device = kwargs.get("video_device")
+    if video_device:
+        parts.append(f"--video-device {shlex.quote(video_device)}")
 
     rec_device = kwargs.get("rec_device")
     if rec_device is not None:
@@ -13285,9 +13676,10 @@ def main():
                 print(f"[錯誤] 雙向模式不支援 {model_name}（僅英文模型），請用多語言模型", file=sys.stderr)
                 sys.exit(1)
 
-            # Apple Silicon + mlx-whisper 自動偵測（依記憶體決定，--asr faster-whisper 可退回）
-            _bidi_engine, _ = _recommended_mic_engine(mode, REMOTE_WHISPER_CONFIG)
-            _use_mlx_bidi = (_bidi_engine == "mlx") and args.asr != "faster-whisper"
+            # Apple Silicon + mlx-whisper 自動偵測（--asr faster-whisper 可退回）
+            _use_mlx_bidi = False
+            if _is_apple_silicon() and _has_mlx_whisper() and args.asr != "faster-whisper":
+                _use_mlx_bidi = True
 
             # 翻譯引擎
             meeting_topic = args.topic
@@ -13338,17 +13730,15 @@ def main():
             if not _confirm_start(_build_cli_command(**_cli_kw)):
                 sys.exit(0)
             print()
-            # 麥克風遠端辨識：有 GPU 伺服器時麥克風也送遠端
-            _mic_remote = REMOTE_WHISPER_CONFIG if REMOTE_WHISPER_CONFIG else None
             run_stream_bidirectional(_bidi_lb_id, _bidi_mic_id,
                                      translator_lb, translator_mic,
                                      model_name, mode,
                                      length_ms=length_ms, step_ms=step_ms,
                                      record=args.record,
+                                     record_video=args.record_video, video_device=args.video_device,
                                      meeting_topic=meeting_topic,
                                      use_mlx=_use_mlx_bidi,
-                                     denoise=args.denoise,
-                                     mic_remote_cfg=_mic_remote)
+                                     denoise=args.denoise)
             sys.exit(0)
 
         # --mic 衝突檢查
@@ -13381,7 +13771,9 @@ def main():
         # GPU 伺服器 Whisper 即時模式（非 Moonshine、非 --local-asr）
         use_remote_cli = (REMOTE_WHISPER_CONFIG and not args.local_asr
                           and asr_engine != "moonshine")
-        # --mic + GPU 伺服器：麥克風也送遠端辨識（不再限制）
+        if use_remote_cli and args.mic:
+            print(f"{C_WARN}[警告] --mic 不支援遠端 GPU 模式，忽略 --mic{RESET}")
+            args.mic = False
         if use_remote_cli:
             # 伺服器模式：不需本機 whisper-stream
             default_model = "large-v3-turbo"
@@ -13445,39 +13837,13 @@ def main():
             if not _confirm_start(_build_cli_command(**_cli_kw)):
                 sys.exit(0)
             print()
-            # --mic + GPU 伺服器：麥克風也送遠端，走雙路架構
-            if args.mic:
-                bidi_devs = _detect_bidi_devices()
-                if bidi_devs:
-                    _mic_lb_id, _, _mic_mic_id, _ = bidi_devs
-                    if getattr(args, 'mic_device', None) is not None:
-                        _mic_mic_id = args.mic_device
-                    print(f"\n{C_DIM}--mic 模式：麥克風辨識也送 GPU 伺服器{RESET}")
-                    run_stream_bidirectional(_mic_lb_id, _mic_mic_id,
-                                             translator, None,
-                                             model_name, mode,
-                                             length_ms=length_ms, step_ms=step_ms,
-                                             record=args.record,
-                                             meeting_topic=meeting_topic,
-                                             use_mlx=False,
-                                             mic_translate=False,
-                                             denoise=args.denoise,
-                                             mic_remote_cfg=REMOTE_WHISPER_CONFIG)
-                else:
-                    print(f"{C_WARN}[警告] 偵測不到麥克風裝置，忽略 --mic{RESET}")
-                    run_stream_remote(capture_id, translator, model_name, REMOTE_WHISPER_CONFIG,
-                                      mode, length_ms, step_ms,
-                                      record=args.record, rec_device=args.rec_device,
-                                      force_restart=args.restart_server,
-                                      meeting_topic=meeting_topic,
-                                      denoise=args.denoise)
-            else:
-                run_stream_remote(capture_id, translator, model_name, REMOTE_WHISPER_CONFIG,
-                                  mode, length_ms, step_ms,
-                                  record=args.record, rec_device=args.rec_device,
-                                  force_restart=args.restart_server,
-                                  meeting_topic=meeting_topic,
-                                  denoise=args.denoise)
+            run_stream_remote(capture_id, translator, model_name, REMOTE_WHISPER_CONFIG,
+                              mode, length_ms, step_ms,
+                              record=args.record, rec_device=args.rec_device,
+                              record_video=args.record_video, video_device=args.video_device,
+                              force_restart=args.restart_server,
+                              meeting_topic=meeting_topic,
+                              denoise=args.denoise)
         elif asr_engine == "moonshine":
             check_dependencies(asr_engine)
             # Moonshine 模式
@@ -13633,44 +13999,43 @@ def main():
                     _mic_lb_id, _, _mic_mic_id, _ = bidi_devs
                     if getattr(args, 'mic_device', None) is not None:
                         _mic_mic_id = args.mic_device
-                    # 麥克風引擎選擇：依記憶體自動決定 mlx GPU / CPU
-                    _mic_engine, _mic_rec_model = _recommended_mic_engine(mode, REMOTE_WHISPER_CONFIG)
-                    _use_mlx = (_mic_engine == "mlx") and args.asr != "faster-whisper"
-                    _mic_model = model_name if _use_mlx else _mic_rec_model
-                    _mem_gb = _get_system_memory_gb()
-                    if _use_mlx:
-                        print(f"\n{C_DIM}--mic 模式：使用 mlx-whisper GPU 加速（{_mic_model}，記憶體 {_mem_gb:.0f}GB）{RESET}")
-                    elif not _has_local_gpu():
-                        _big_models = ("large-v3-turbo", "large-v3")
+                    _use_mlx = _is_apple_silicon() and _has_mlx_whisper() and args.asr != "faster-whisper"
+                    # 效能檢查：--mic 改用 faster-whisper/mlx-whisper，模型可能需要調整
+                    _mic_rec_model = _recommended_whisper_model(mode)
+                    _mic_model = model_name
+                    if not _use_mlx and not _has_local_gpu():
+                        # 無 GPU 加速，大模型在 faster-whisper CPU 上會太慢
+                        _big_models = ("large-v3-turbo", "large-v3", "medium", "medium.en")
                         if model_name in _big_models and _mic_rec_model not in _big_models:
-                            print(f"\n{C_WARN}[效能提示] --mic 模式改用 faster-whisper 雙路辨識{RESET}")
-                            if _mem_gb and _mem_gb < 16:
-                                print(f"  {C_WARN}記憶體 {_mem_gb:.0f}GB 不足，不啟用 mlx GPU 加速{RESET}")
-                            print(f"  {C_WARN}自動調整為 {_mic_rec_model}（適合此裝置）{RESET}")
+                            print(f"\n{C_WARN}[效能提示] --mic 模式改用 faster-whisper 雙路辨識（非 whisper-stream）{RESET}")
+                            print(f"  {C_WARN}此裝置無 GPU 加速，{model_name} 辨識可能太慢（每段 10s+）{RESET}")
+                            print(f"  {C_WARN}自動調整為 {_mic_rec_model}（適合此裝置的 faster-whisper 模型）{RESET}")
                             _mic_model = _mic_rec_model
-                    else:
-                        print(f"\n{C_DIM}--mic 模式：ASR 引擎 faster-whisper 雙路辨識{RESET}")
-                    _mic_remote = REMOTE_WHISPER_CONFIG if (_mic_engine == "remote") else None
+                    elif not _use_mlx:
+                        # 有 GPU 但不是 mlx，提示引擎切換
+                        print(f"\n{C_DIM}--mic 模式：ASR 引擎切換為 faster-whisper 雙路辨識{RESET}")
                     run_stream_bidirectional(_mic_lb_id, _mic_mic_id,
                                              translator, None,
                                              _mic_model, mode,
                                              length_ms=length_ms, step_ms=step_ms,
                                              record=args.record,
+                                             record_video=args.record_video, video_device=args.video_device,
                                              meeting_topic=meeting_topic,
                                              use_mlx=_use_mlx,
                                              mic_translate=False,
-                                             denoise=args.denoise,
-                                             mic_remote_cfg=_mic_remote)
+                                             denoise=args.denoise)
                     sys.exit(0)
             if _cli_use_local_fw:
                 run_stream_local_whisper(capture_id, translator, model_name, mode,
                                         length_ms=length_ms, step_ms=step_ms,
                                         record=args.record, rec_device=args.rec_device,
+                                        record_video=args.record_video, video_device=args.video_device,
                                         meeting_topic=meeting_topic,
                                         denoise=args.denoise)
             else:
                 run_stream(capture_id, translator, model_name, model_path, length_ms, step_ms, mode,
                            record=args.record, rec_device=args.rec_device,
+                           record_video=args.record_video, video_device=args.video_device,
                            meeting_topic=meeting_topic)
     else:
         # 互動式選單
@@ -13709,9 +14074,10 @@ def main():
             # 強制多語言 faster-whisper 模型
             model_name, _ = select_whisper_model(mode, use_faster_whisper=True)
 
-            # Apple Silicon + mlx-whisper 自動偵測（依記憶體決定）
-            _bidi_engine, _ = _recommended_mic_engine(mode, REMOTE_WHISPER_CONFIG)
-            _use_mlx_bidi = (_bidi_engine == "mlx")
+            # Apple Silicon + mlx-whisper 自動偵測
+            _use_mlx_bidi = False
+            if _is_apple_silicon() and _has_mlx_whisper():
+                _use_mlx_bidi = True
 
             # 選擇翻譯引擎（排除 Argos）
             engine, model, host, port, srv_type = select_translator(mode=mode)
@@ -13752,16 +14118,15 @@ def main():
             if not _confirm_start(_build_cli_command(**_cli_kw)):
                 sys.exit(0)
             print()
-            _mic_remote = REMOTE_WHISPER_CONFIG if REMOTE_WHISPER_CONFIG else None
             run_stream_bidirectional(_bidi_lb_id, _bidi_mic_id,
                                      translator_lb, translator_mic,
                                      model_name, mode,
                                      length_ms=length_ms, step_ms=step_ms,
                                      record=record_bidi,
+                                     record_video=args.record_video, video_device=args.video_device,
                                      meeting_topic=meeting_topic,
                                      use_mlx=_use_mlx_bidi,
-                                     denoise=args.denoise,
-                                     mic_remote_cfg=_mic_remote)
+                                     denoise=args.denoise)
             sys.exit(0)
 
         # 轉錄模式：提前詢問麥克風轉錄（影響辨識位置預設值）
@@ -13835,6 +14200,7 @@ def main():
             run_stream_remote(capture_id, translator, r_model_name, REMOTE_WHISPER_CONFIG,
                               mode, length_ms=length_ms, step_ms=step_ms,
                               record=record, rec_device=rec_device,
+                              record_video=args.record_video, video_device=args.video_device,
                               force_restart=args.restart_server,
                               meeting_topic=meeting_topic,
                               denoise=args.denoise)
@@ -13942,19 +14308,15 @@ def main():
                 if use_mic and bidi_devs:
                     # --mic 互動模式：切換到雙路架構
                     _mic_lb_id, _, _mic_mic_id, _ = bidi_devs
-                    # 麥克風引擎選擇：依記憶體自動決定 mlx GPU / CPU
-                    _mic_engine, _mic_rec_model = _recommended_mic_engine(mode, REMOTE_WHISPER_CONFIG)
-                    _use_mlx_mic = (_mic_engine == "mlx")
-                    _mic_model = model_name if _use_mlx_mic else _mic_rec_model
-                    _mem_gb = _get_system_memory_gb()
-                    if _use_mlx_mic:
-                        print(f"\n{C_DIM}麥克風轉錄：使用 mlx-whisper GPU 加速（{_mic_model}，記憶體 {_mem_gb:.0f}GB）{RESET}")
-                    elif not _has_local_gpu():
-                        _big_models = ("large-v3-turbo", "large-v3")
+                    _use_mlx_mic = _is_apple_silicon() and _has_mlx_whisper()
+                    # 效能檢查：模型是否適合 faster-whisper/mlx-whisper 雙路
+                    _mic_model = model_name
+                    _mic_rec_model = _recommended_whisper_model(mode)
+                    if not _use_mlx_mic and not _has_local_gpu():
+                        _big_models = ("large-v3-turbo", "large-v3", "medium", "medium.en")
                         if model_name in _big_models and _mic_rec_model not in _big_models:
                             print(f"\n{C_WARN}[效能提示] 麥克風轉錄改用 faster-whisper 雙路辨識{RESET}")
-                            if _mem_gb and _mem_gb < 16:
-                                print(f"  {C_WARN}記憶體 {_mem_gb:.0f}GB，不啟用 mlx GPU 加速{RESET}")
+                            print(f"  {C_WARN}此裝置無 GPU 加速，{model_name} 辨識可能太慢{RESET}")
                             print(f"  {C_WARN}自動調整為 {_mic_rec_model}{RESET}")
                             _mic_model = _mic_rec_model
                     _need_llm = mode in _TRANSLATE_MODES and engine == "llm"
@@ -13967,17 +14329,16 @@ def main():
                                    mic=True, denoise=args.denoise)
                     if not _confirm_start(_build_cli_command(**_cli_kw)):
                         sys.exit(0)
-                    _mic_remote = REMOTE_WHISPER_CONFIG if (_mic_engine == "remote") else None
                     run_stream_bidirectional(_mic_lb_id, _mic_mic_id,
                                              translator, None,
                                              _mic_model, mode,
                                              length_ms=length_ms, step_ms=step_ms,
                                              record=record,
+                                             record_video=args.record_video, video_device=args.video_device,
                                              meeting_topic=meeting_topic,
                                              use_mlx=_use_mlx_mic,
                                              mic_translate=False,
-                                             denoise=args.denoise,
-                                             mic_remote_cfg=_mic_remote)
+                                             denoise=args.denoise)
                 elif _use_local_fw:
                     # Windows WASAPI + faster-whisper 本機辨識
                     capture_id = list_audio_devices_sd()
@@ -13994,6 +14355,7 @@ def main():
                     run_stream_local_whisper(capture_id, translator, model_name, mode,
                                             length_ms=length_ms, step_ms=step_ms,
                                             record=record, rec_device=rec_device,
+                                            record_video=args.record_video, video_device=args.video_device,
                                             meeting_topic=meeting_topic,
                                             denoise=args.denoise)
                 else:
@@ -14009,6 +14371,7 @@ def main():
                         sys.exit(0)
                     run_stream(capture_id, translator, model_name, model_path, length_ms, step_ms, mode,
                                record=record, rec_device=rec_device,
+                               record_video=args.record_video, video_device=args.video_device,
                                meeting_topic=meeting_topic)
 
 

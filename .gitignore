@@ -1,0 +1,24 @@
+# Python cache and bytecode
+__pycache__/
+*.py[cod]
+*.pyo
+
+# Local virtual environments
+venv/
+.venv/
+env/
+Lib/
+Scripts/
+Include/
+pyvenv.cfg
+
+# Runtime/temp files
+.webui_pause_cmd
+*.log
+
+# Local outputs
+logs/
+recordings/
+
+# Local vendor/build dependency checkout
+whisper.cpp/

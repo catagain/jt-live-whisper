@@ -97,8 +97,9 @@ $banner_line = '=' * $cols
 
 Write-Host ""
 Write-Host "${C_TITLE}${banner_line}${NC}"
-Write-Host "${C_TITLE}${BOLD}  jt-live-whisper v2.16.1 - 100% 全地端 AI 語音工具集${NC}"
-Write-Host "${C_TITLE}  by Jason Cheng (Jason Tools)${NC}"
+Write-Host "${C_TITLE}${BOLD}  jt-live-whisper v2.15.5 video specialization mode - 100% 全地端 AI 語音工具集${NC}"
+Write-Host "${C_TITLE}  by 貓又 CatAgain${NC}"
+Write-Host "${C_TITLE}  fork from jt-live-whisper by Jason Cheng (Jason Tools)${NC}"
 Write-Host "${C_TITLE}${banner_line}${NC}"
 Write-Host ""
 Write-Host "${C_DIM}  提示：已自動關閉終端機「快速編輯」模式，避免滑鼠誤點導致程式凍結${NC}"

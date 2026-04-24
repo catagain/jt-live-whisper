@@ -100,6 +100,49 @@ from contextlib import asynccontextmanager
 # 子程序管理
 _proc: subprocess.Popen = None
 _proc_lock = threading.Lock()
+_proc_log_path = None
+_proc_stopping = False
+
+
+def _stream_proc_output(proc, log_path: Path):
+    try:
+        with open(log_path, "a", encoding="utf-8", errors="replace") as lf:
+            lf.write(f"[info] logging started at {time.strftime('%Y-%m-%d %H:%M:%S')}\n")
+            lf.flush()
+            if not proc or not proc.stdout:
+                return
+            for raw in proc.stdout:
+                line = raw.rstrip("\n")
+                print(line, flush=True)
+                lf.write(raw)
+                lf.flush()
+    except Exception as e:
+        print(f"[警告] 無法寫入子程序輸出日誌: {e}", flush=True)
+
+
+def _kill_orphan_recording_ffmpeg():
+    """清理可能殘留的 ffmpeg 錄影子程序（_tmp_seg*.mkv）。"""
+    try:
+        if sys.platform != "win32":
+            return
+        script = (
+            "$procs = Get-CimInstance Win32_Process | "
+            "Where-Object { $_.Name -match '^ffmpeg(\\.exe)?$' -and $_.CommandLine -match '_tmp_seg\\d+\\.mkv' }; "
+            "$pids = @($procs | Select-Object -ExpandProperty ProcessId); "
+            "foreach ($pid in $pids) { try { Stop-Process -Id $pid -Force -ErrorAction Stop } catch {} }; "
+            "$pids -join ','"
+        )
+        r = subprocess.run(
+            ["powershell", "-NoProfile", "-Command", script],
+            capture_output=True,
+            text=True,
+            creationflags=subprocess.CREATE_NO_WINDOW,
+        )
+        killed = (r.stdout or "").strip()
+        if killed:
+            print(f"[WebUI] 已清理殘留 ffmpeg 錄影程序 PID: {killed}", flush=True)
+    except Exception as e:
+        print(f"[WebUI] 清理殘留 ffmpeg 程序失敗: {e}", flush=True)
 
 
 @asynccontextmanager
@@ -189,22 +232,57 @@ async def _event_dispatcher():
 
 # ─── 子程序管理 ──────────────────────────────────────────────
 def _stop_proc():
-    global _proc
+    global _proc, _proc_stopping
     with _proc_lock:
+        if _proc_stopping:
+            print("[WebUI] stop 已在進行中，忽略重複請求", flush=True)
+            return
         if _proc and _proc.poll() is None:
+            _proc_stopping = True
             pid = _proc.pid
-            # SIGINT 讓 signal handler 正常清理（儲存錄音檔等），最多等 6 秒
+            print(f"[WebUI] 發送停止訊號至 PID {pid}", flush=True)
+            # 優雅停止：給子程序足夠時間完成錄音/錄影收尾與合併。
             try:
-                os.kill(pid, signal.SIGINT)
-                _proc.wait(timeout=6)
-            except Exception:
-                # 超時：強制 SIGKILL
                 try:
-                    os.kill(pid, 9)
-                    _proc.wait(timeout=2)
-                except Exception:
+                    # 先走程序內停止命令，避免 Windows 訊號遺失。
+                    try:
+                        (BASE_DIR / ".webui_pause_cmd").write_text("stop", encoding="utf-8")
+                        print("[WebUI] 已寫入 stop 命令檔，等待主程式自行收尾", flush=True)
+                        _proc.wait(timeout=150)
+                    except Exception:
                         pass
-            _proc = None
+                    if _proc.poll() is not None:
+                        print("[WebUI] 主程式已自行停止", flush=True)
+                        return
+                    if sys.platform == "win32" and hasattr(signal, "CTRL_BREAK_EVENT"):
+                        try:
+                            _proc.send_signal(signal.CTRL_BREAK_EVENT)
+                            print("[WebUI] 已送出 CTRL_BREAK_EVENT", flush=True)
+                        except Exception:
+                            os.kill(pid, signal.SIGINT)
+                            print("[WebUI] CTRL_BREAK_EVENT 失敗，改送 SIGINT", flush=True)
+                    else:
+                        os.kill(pid, signal.SIGINT)
+                        print("[WebUI] 已送出 SIGINT", flush=True)
+                    # 長錄影合併可能超過 30 秒，避免過早強制 kill 造成 mkv 殘留。
+                    _proc.wait(timeout=120)
+                except Exception:
+                    # 仍未結束才逐級強制停止
+                    try:
+                        print("[WebUI] 優雅停止逾時，嘗試 terminate", flush=True)
+                        _proc.terminate()
+                        _proc.wait(timeout=5)
+                    except Exception:
+                        try:
+                            print("[WebUI] terminate 失敗，改用 kill", flush=True)
+                            os.kill(pid, 9)
+                            _proc.wait(timeout=2)
+                        except Exception:
+                            pass
+            finally:
+                _proc = None
+                _proc_stopping = False
+    _kill_orphan_recording_ffmpeg()
     # 清理靜音 flag 檔案
     for fn in (".mute_lb", ".mute_mic"):
         try:
@@ -235,27 +313,43 @@ def _stop_proc():
 
 
 def _start_proc(args: list):
-    global _proc
+    global _proc, _proc_log_path
     _stop_proc()
     with _proc_lock:
         cmd = [sys.executable, str(TRANSLATE_SCRIPT), "--webui"] + args
+        _logs_dir.mkdir(parents=True, exist_ok=True)
+        _proc_log_path = _logs_dir / f"translate_meeting_{time.strftime('%Y%m%d_%H%M%S')}.log"
         # stdin 持續送 'y\n' 自動確認所有互動提問（確認開始、錄音等）
-        _proc = subprocess.Popen(cmd, cwd=str(BASE_DIR),
-                                 stdin=subprocess.PIPE,
-                                 start_new_session=True)
+        popen_kwargs = {
+            "cwd": str(BASE_DIR),
+            "stdin": subprocess.PIPE,
+            "stdout": subprocess.PIPE,
+            "stderr": subprocess.STDOUT,
+            "text": True,
+            "encoding": "utf-8",
+            "errors": "replace",
+            "bufsize": 1,
+        }
+        if sys.platform == "win32":
+            popen_kwargs["creationflags"] = subprocess.CREATE_NEW_PROCESS_GROUP
+        else:
+            popen_kwargs["start_new_session"] = True
+        _proc = subprocess.Popen(cmd, **popen_kwargs)
         _proc._start_time = time.monotonic()
+        print(f"[WebUI] 主程式日誌: {_proc_log_path}", flush=True)
         # 背景持續送 y 回答所有 input() 提問（確認開始、錄音、場景等）
         def _auto_yes():
             try:
                 for _ in range(30):
                     if _proc.poll() is not None:
                         break
-                    _proc.stdin.write(b"y\n")
+                    _proc.stdin.write("y\n")
                     _proc.stdin.flush()
                     time.sleep(0.3)
             except Exception:
                 pass
         threading.Thread(target=_auto_yes, daemon=True).start()
+        threading.Thread(target=_stream_proc_output, args=(_proc, _proc_log_path), daemon=True).start()
         # 監控子程序結束，推送斷線事件到瀏覽器
         def _monitor():
             p = _proc  # 保留本地參照，避免 _stop_proc 將 _proc 設為 None
@@ -822,6 +916,11 @@ def _build_args(body: dict) -> list:
         args.extend(["--topic", topic])
     if body.get("record"):
         args.append("--record")
+    if body.get("record_video"):
+        args.append("--record-video")
+    video_device = body.get("video_device", "").strip()
+    if video_device:
+        args.extend(["--video-device", video_device])
     if body.get("mic"):
         args.append("--mic")
     if body.get("denoise"):
@@ -873,6 +972,8 @@ async def api_start(request: Request, body: dict = {}):
             "llm_model": body.get("llm_model"), "llm_host": body.get("llm_host"),
             "local_asr": body.get("local_asr", False),
             "record": body.get("record", False), "mic": body.get("mic", False),
+            "record_video": body.get("record_video", False),
+            "video_device": body.get("video_device", ""),
             "denoise": body.get("denoise", True),
             "diarize": body.get("diarize", False),
             "num_speakers": body.get("num_speakers", 0),
@@ -982,11 +1083,15 @@ async def websocket_endpoint(ws: WebSocket):
                         except Exception:
                             pass
                 elif msg.get("action") in ("pause", "resume"):
-                    # 送 SIGUSR1 到 translate_meeting.py 切換暫停
+                    # 通知 translate_meeting.py 切換暫停
                     with _proc_lock:
                         if _proc and _proc.poll() is None:
                             try:
-                                os.kill(_proc.pid, signal.SIGUSR1)
+                                if sys.platform == "win32":
+                                    cmd_path = BASE_DIR / ".webui_pause_cmd"
+                                    cmd_path.write_text(msg.get("action", "toggle"), encoding="utf-8")
+                                elif hasattr(signal, "SIGUSR1"):
+                                    os.kill(_proc.pid, signal.SIGUSR1)
                             except Exception:
                                 pass
             except Exception:
