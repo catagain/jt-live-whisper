@@ -527,10 +527,10 @@ cd C:\jt-live-whisper
 
 | 參數 | 說明 | 預設值 |
 |------|------|--------|
-| `--webui` | 啟動 WebUI 瀏覽器介面 | |
+| `--webui` | 同時將即時字幕推送到 WebUI（需另外啟動 `webui.py`） | |
 | `--mode MODE` | 功能模式 (`en2zh` / `zh2en` / `ja2zh` / `zh2ja` / `en_zh` / `ja_zh` / `en` / `zh` / `ja` / `record`) | `en2zh` |
 | `--asr ASR` | 語音辨識引擎 (`whisper` / `moonshine` / `faster-whisper`) | `whisper` |
-| `-m`, `--model MODEL` | Whisper 模型 (`base.en` / `small.en` / `small` / `medium.en` / `medium` / `large-v3-turbo` / `large-v3`) | 依裝置推薦 |
+| `-m`, `--model MODEL` | Whisper 模型 (`base.en` / `base` / `small.en` / `small` / `large-v3-turbo` / `large-v3`) | 依裝置推薦 |
 | `--moonshine-model MODEL` | Moonshine 模型 (`medium` / `small` / `tiny`) | `medium` |
 | `-s`, `--scene SCENE` | 使用場景 (`meeting` / `training` / `presentation` / `subtitle`) | `training` |
 | `-e`, `--engine ENGINE` | 翻譯引擎 (`llm` / `nllb` / `argos`) | `llm` |
@@ -539,16 +539,23 @@ cd C:\jt-live-whisper
 | `--topic TOPIC` | 會議主題（提升翻譯與摘要品質） | |
 | `-d`, `--device ID` | 音訊裝置 ID（可用 `--list-devices` 查詢） | 自動偵測 |
 | `--list-devices` | 列出可用音訊裝置後離開 | |
+| `--subtitle-overlay` | 啟動桌面懸浮字幕覆蓋視窗（需安裝 PyQt6） | |
 | `--input FILE [...]` | 離線處理音訊檔 | |
 | `--diarize` | 啟用講者辨識（需搭配 `--input`） | |
 | `--num-speakers N` | 指定講者人數（需搭配 `--diarize`） | 自動偵測 |
 | `--summarize [FILE ...]` | 生成 AI 摘要（與 `--input` 合用時不需指定檔案） | |
 | `--summary-model MODEL` | 摘要用 LLM 模型 | `gpt-oss:120b` |
+| `--summary-rounds N` | 摘要處理次數（1-3，多次處理後整合） | `1` |
 | `--mic` | 同時轉錄麥克風語音（即時模式） | |
+| `--mic-device ID` | 麥克風裝置 ID（`--mic` 或雙向模式時指定） | |
 | `--record` | 即時模式同時錄製音訊 | |
+| `--record-video` | 即時模式同時錄製螢幕與攝影機畫面 | |
+| `--video-device NAME` | 攝影機裝置名稱（Windows dshow） | |
 | `--rec-device ID` | 錄音裝置 ID（可與辨識裝置不同） | |
 | `--denoise` | 即時模式啟用背景降噪 | |
 | `--local-asr` | 強制使用本機辨識（忽略 GPU 伺服器設定） | |
+| `--no-srt` | 離線處理不產生 SRT 字幕檔 | |
+| `--no-vtt` | 離線處理不產生 VTT 字幕檔 | |
 | `--restart-server` | 強制重啟 GPU 伺服器 | |
 
 &nbsp;
