@@ -4012,7 +4012,10 @@ def run_stream(capture_id: int, translator, model_name: str, model_path: str,
                length_ms: int = 5000, step_ms: int = 3000, mode: str = "en2zh",
                record: bool = False, rec_device: int = None,
                record_video: bool = False, video_device: str = None,
-               meeting_topic: str = None):
+               meeting_topic: str = None,
+               post_summary_mode: str = None, post_summary_model: str = None,
+               post_llm_host: str = None, post_llm_port: int = None,
+               post_llm_server_type: str = None):
     """啟動 whisper-stream 子程序並即時翻譯輸出"""
 
     whisper_lang = "en" if mode in _EN_INPUT_MODES else ("ja" if mode in _JA_INPUT_MODES else "zh")
@@ -4226,12 +4229,34 @@ def run_stream(capture_id: int, translator, model_name: str, model_path: str,
             final_audio_path = recorder.close()
             print(f"\n  {C_OK}✓ 錄音已儲存: {final_audio_path}{RESET}", flush=True)
             print(f"  {C_DIM}提示: 可再次執行本程式，選擇「讀入檔案」匯入錄音檔，產生逐字稿校正與 AI 摘要{RESET}", flush=True)
+        video_path = ""
         if video_recorder:
             try:
                 video_path = video_recorder.finalize(final_audio_path)
                 print(f"\n  {C_OK}✓ 錄影已儲存: {video_path}{RESET}", flush=True)
             except Exception as e:
                 print(f"\n{C_HIGHLIGHT}[警告] 影片錄製或合併失敗: {e}{RESET}", flush=True)
+        package_info = _package_realtime_outputs(
+            log_path,
+            mode,
+            segments_data=realtime_segments,
+            audio_paths=[final_audio_path] if final_audio_path else [],
+            video_path=video_path,
+            meeting_topic=meeting_topic,
+        )
+        _run_realtime_postprocess(
+            package_info["log_path"],
+            post_summary_mode,
+            post_summary_model,
+            post_llm_host,
+            post_llm_port,
+            post_llm_server_type or "ollama",
+            topic=meeting_topic,
+            audio_path=package_info["primary_media_path"] or final_audio_path or "",
+        )
+        if package_info["session_dir"]:
+            _webui_send_output_files([package_info["session_dir"]])
+            open_file_in_editor(package_info["session_dir"])
         print(f"\n{C_DIM}正在停止...{RESET}", flush=True)
         _webui_send({"type": "progress", "stage": "正在停止", "detail": ""})
         proc.terminate()
@@ -4286,6 +4311,9 @@ def run_stream(capture_id: int, translator, model_name: str, model_path: str,
     _webui_send({"type": "progress", "stage": "", "detail": ""})
     _webui_send({"type": "started", "mode": mode})
 
+    session_started_at = time.monotonic()
+    realtime_segments = []
+
     # 設定底部固定狀態列（快捷鍵提示 + 即時資訊）
     _tr_model = translator.model if isinstance(translator, OllamaTranslator) else ("NLLB" if isinstance(translator, NllbTranslator) else ("Argos" if isinstance(translator, ArgosTranslator) else ""))
     _tr_loc = "伺服器" if isinstance(translator, OllamaTranslator) else ("本機" if isinstance(translator, (ArgosTranslator, NllbTranslator)) else "")
@@ -4332,6 +4360,15 @@ def run_stream(capture_id: int, translator, model_name: str, model_path: str,
             with open(log_path, "a", encoding="utf-8") as log_f:
                 log_f.write(f"[{timestamp}] [{src_label}] {src_text}\n")
                 log_f.write(f"[{timestamp}] [{dst_label}] {result}\n\n")
+            _append_realtime_segment(
+                realtime_segments,
+                [
+                    {"label": src_label, "text": src_text},
+                    {"label": dst_label, "text": result},
+                ],
+                time.monotonic() - session_started_at,
+                (asr_elapsed or 0) + (elapsed or 0),
+            )
             _webui_send({"type": "transcription", "source": "main",
                          "src_lang": src_label, "src_text": src_text,
                          "dst_lang": dst_label, "dst_text": result,
@@ -4433,6 +4470,12 @@ def run_stream(capture_id: int, translator, model_name: str, model_path: str,
                             timestamp = time.strftime("%H:%M:%S")
                             with open(log_path, "a", encoding="utf-8") as log_f:
                                 log_f.write(f"[{timestamp}] [EN] {line}\n\n")
+                            _append_realtime_segment(
+                                realtime_segments,
+                                [{"label": "EN", "text": line}],
+                                time.monotonic() - session_started_at,
+                                _asr_elapsed,
+                            )
                             _webui_send({"type": "transcription", "source": "main",
                                          "src_lang": "EN", "src_text": line,
                                          "asr_time": round(_asr_elapsed, 1),
@@ -4465,6 +4508,12 @@ def run_stream(capture_id: int, translator, model_name: str, model_path: str,
                             timestamp = time.strftime("%H:%M:%S")
                             with open(log_path, "a", encoding="utf-8") as log_f:
                                 log_f.write(f"[{timestamp}] [{_src_l}] {line}\n\n")
+                            _append_realtime_segment(
+                                realtime_segments,
+                                [{"label": _src_l, "text": line}],
+                                time.monotonic() - session_started_at,
+                                _asr_elapsed,
+                            )
                             _webui_send({"type": "transcription", "source": "main",
                                          "src_lang": _src_l, "src_text": line,
                                          "asr_time": round(_asr_elapsed, 1),
@@ -4532,6 +4581,12 @@ def run_stream(capture_id: int, translator, model_name: str, model_path: str,
                         timestamp = time.strftime("%H:%M:%S")
                         with open(log_path, "a", encoding="utf-8") as log_f:
                             log_f.write(f"[{timestamp}] [中] {line}\n\n")
+                        _append_realtime_segment(
+                            realtime_segments,
+                            [{"label": "中", "text": line}],
+                            time.monotonic() - session_started_at,
+                            _asr_elapsed,
+                        )
                         _webui_send({"type": "transcription", "source": "main",
                                      "src_lang": "中", "src_text": line,
                                      "asr_time": round(_asr_elapsed, 1),
@@ -5018,7 +5073,10 @@ def run_stream_remote(capture_id: int, translator, model_name: str,
                       record_video: bool = False, video_device: str = None,
                       force_restart: bool = False,
                       meeting_topic: str = None,
-                      denoise: bool = False):
+                      denoise: bool = False,
+                      post_summary_mode: str = None, post_summary_model: str = None,
+                      post_llm_host: str = None, post_llm_port: int = None,
+                      post_llm_server_type: str = None):
     """使用GPU 伺服器 Whisper 即時辨識：本機 sounddevice 擷取音訊 →
     環形緩衝 → 定期上傳 WAV 到伺服器 → 取回結果 → 翻譯顯示"""
     import numpy as np
@@ -5325,6 +5383,15 @@ def run_stream_remote(capture_id: int, translator, model_name: str,
             with open(_log_path, "a", encoding="utf-8") as log_f:
                 log_f.write(f"[{timestamp}] [{src_label}] {src_text}\n")
                 log_f.write(f"[{timestamp}] [{dst_label}] {result}\n\n")
+            _append_realtime_segment(
+                realtime_segments,
+                [
+                    {"label": src_label, "text": src_text},
+                    {"label": dst_label, "text": result},
+                ],
+                time.monotonic() - session_started_at,
+                (asr_elapsed or 0) + (elapsed or 0),
+            )
             _webui_send({"type": "transcription", "source": "main",
                          "src_lang": src_label, "src_text": src_text,
                          "dst_lang": dst_label, "dst_text": result,
@@ -5439,6 +5506,12 @@ def run_stream_remote(capture_id: int, translator, model_name: str,
                     timestamp = time.strftime("%H:%M:%S")
                     with open(log_path, "a", encoding="utf-8") as log_f:
                         log_f.write(f"[{timestamp}] [{src_label}] {line}\n\n")
+                    _append_realtime_segment(
+                        realtime_segments,
+                        [{"label": src_label, "text": line}],
+                        time.monotonic() - session_started_at,
+                        proc_time,
+                    )
                     _webui_send({"type": "transcription", "source": "main",
                                  "src_lang": src_label, "src_text": line,
                                  "asr_time": round(proc_time, 1), "timestamp": timestamp})
@@ -5476,6 +5549,7 @@ def run_stream_remote(capture_id: int, translator, model_name: str,
             final_audio_path = recorder.close()
             print(f"\n  {C_OK}✓ 錄音已儲存: {final_audio_path}{RESET}", flush=True)
             print(f"  {C_DIM}提示: 可再次執行本程式，選擇「讀入檔案」匯入錄音檔，產生逐字稿校正與 AI 摘要{RESET}", flush=True)
+        video_path = ""
         if video_recorder:
             try:
                 print(f"{C_DIM}[DEBUG] remote cleanup: 開始 finalize video{RESET}", flush=True)
@@ -5483,6 +5557,27 @@ def run_stream_remote(capture_id: int, translator, model_name: str,
                 print(f"\n  {C_OK}✓ 錄影已儲存: {video_path}{RESET}", flush=True)
             except Exception as e:
                 print(f"\n{C_HIGHLIGHT}[警告] 影片錄製或合併失敗: {e}{RESET}", flush=True)
+        package_info = _package_realtime_outputs(
+            log_path,
+            mode,
+            segments_data=realtime_segments,
+            audio_paths=[final_audio_path] if final_audio_path else [],
+            video_path=video_path,
+            meeting_topic=meeting_topic,
+        )
+        _run_realtime_postprocess(
+            package_info["log_path"],
+            post_summary_mode,
+            post_summary_model,
+            post_llm_host,
+            post_llm_port,
+            post_llm_server_type or "ollama",
+            topic=meeting_topic,
+            audio_path=package_info["primary_media_path"] or final_audio_path or "",
+        )
+        if package_info["session_dir"]:
+            _webui_send_output_files([package_info["session_dir"]])
+            open_file_in_editor(package_info["session_dir"])
         # 伺服器保持執行（不停止，允許多實例共用）
         _ssh_close_cm(remote_cfg)
 
@@ -5530,6 +5625,9 @@ def run_stream_remote(capture_id: int, translator, model_name: str,
     print(f"{C_OK}{BOLD}開始監聽...{RESET} {C_WHITE}{listen_hints.get(mode, '')}{RESET}\n\n", flush=True)
     _webui_send({"type": "progress", "stage": "", "detail": ""})
     _webui_send({"type": "started", "mode": mode})
+
+    session_started_at = time.monotonic()
+    realtime_segments = []
 
     _tr_model = translator.model if isinstance(translator, OllamaTranslator) else ("NLLB" if isinstance(translator, NllbTranslator) else ("Argos" if isinstance(translator, ArgosTranslator) else ""))
     _tr_loc = "伺服器" if isinstance(translator, OllamaTranslator) else ("本機" if isinstance(translator, (ArgosTranslator, NllbTranslator)) else "")
@@ -5607,7 +5705,10 @@ def run_stream_local_whisper(capture_id: int, translator, model_name: str,
                              record: bool = False, rec_device: int = None,
                              record_video: bool = False, video_device: str = None,
                              meeting_topic: str = None,
-                             denoise: bool = False):
+                             denoise: bool = False,
+                             post_summary_mode: str = None, post_summary_model: str = None,
+                             post_llm_host: str = None, post_llm_port: int = None,
+                             post_llm_server_type: str = None):
     """Windows 專用：sounddevice/WASAPI 擷取音訊 → 本機 faster-whisper 即時辨識。
     架構類似 run_stream_remote()，但用本機 faster-whisper 取代遠端 HTTP 上傳。"""
     import numpy as np
@@ -6100,6 +6201,7 @@ def run_stream_local_whisper(capture_id: int, translator, model_name: str,
             final_audio_path = recorder.close()
             print(f"\n  {C_OK}錄音已儲存: {final_audio_path}{RESET}", flush=True)
             print(f"  {C_DIM}提示: 可再次執行本程式，選擇「讀入檔案」匯入錄音檔，產生逐字稿校正與 AI 摘要{RESET}", flush=True)
+        video_path = ""
         if video_recorder:
             try:
                 print(f"{C_DIM}[DEBUG] local cleanup: 開始 finalize video{RESET}", flush=True)
@@ -6107,6 +6209,27 @@ def run_stream_local_whisper(capture_id: int, translator, model_name: str,
                 print(f"\n  {C_OK}錄影已儲存: {video_path}{RESET}", flush=True)
             except Exception as e:
                 print(f"\n{C_HIGHLIGHT}[警告] 影片錄製或合併失敗: {e}{RESET}", flush=True)
+        package_info = _package_realtime_outputs(
+            log_path,
+            mode,
+            segments_data=realtime_segments,
+            audio_paths=[final_audio_path] if final_audio_path else [],
+            video_path=video_path,
+            meeting_topic=meeting_topic,
+        )
+        _run_realtime_postprocess(
+            package_info["log_path"],
+            post_summary_mode,
+            post_summary_model,
+            post_llm_host,
+            post_llm_port,
+            post_llm_server_type or "ollama",
+            topic=meeting_topic,
+            audio_path=package_info["primary_media_path"] or final_audio_path or "",
+        )
+        if package_info["session_dir"]:
+            _webui_send_output_files([package_info["session_dir"]])
+            open_file_in_editor(package_info["session_dir"])
 
     _sigint_count_lc = [0]
     _cleanup_in_progress_lc = [False]
@@ -6167,6 +6290,9 @@ def run_stream_local_whisper(capture_id: int, translator, model_name: str,
     }
     print(f"\n{C_OK}{BOLD}開始監聽...{RESET} {C_WHITE}{listen_hints.get(mode, '')}{RESET}\n\n", flush=True)
     _webui_send({"type": "started", "mode": mode})
+
+    session_started_at = time.monotonic()
+    realtime_segments = []
 
     _tr_model = translator.model if isinstance(translator, OllamaTranslator) else ("NLLB" if isinstance(translator, NllbTranslator) else ("Argos" if isinstance(translator, ArgosTranslator) else ""))
     _tr_loc = "伺服器" if isinstance(translator, OllamaTranslator) else ("本機" if isinstance(translator, (ArgosTranslator, NllbTranslator)) else "")
@@ -6239,7 +6365,10 @@ def run_stream_bidirectional(lb_device_id, mic_device_id,
                               meeting_topic: str = None,
                               use_mlx: bool = False,
                               mic_translate: bool = True,
-                              denoise: bool = False):
+                              denoise: bool = False,
+                              post_summary_mode: str = None, post_summary_model: str = None,
+                              post_llm_host: str = None, post_llm_port: int = None,
+                              post_llm_server_type: str = None):
     """雙向即時翻譯：兩路音訊串流 → 共用 faster-whisper/mlx-whisper → 各自翻譯 → 交錯輸出。
     lb_device_id: 系統音訊（BlackHole / WASAPI Loopback）
     mic_device_id: 麥克風
@@ -7008,6 +7137,12 @@ def run_stream_bidirectional(lb_device_id, mic_device_id,
                 _log_prefix = "◀ " if source == "loopback" else "▶ "
                 with open(log_path, "a", encoding="utf-8") as log_f:
                     log_f.write(f"[{timestamp}] {_log_prefix}[{src_label}] {src_text}\n\n")
+                _append_realtime_segment(
+                    realtime_segments,
+                    [{"label": src_label, "text": src_text}],
+                    time.monotonic() - session_started_at,
+                    asr_elapsed,
+                )
                 _webui_send({"type": "transcription", "source": source,
                              "src_lang": src_label, "src_text": src_text,
                              "asr_time": round(asr_elapsed, 1), "timestamp": timestamp})
@@ -7029,6 +7164,15 @@ def run_stream_bidirectional(lb_device_id, mic_device_id,
             with open(log_path, "a", encoding="utf-8") as log_f:
                 log_f.write(f"[{timestamp}] {_log_prefix}[{src_label}] {src_text}\n")
                 log_f.write(f"[{timestamp}] {_log_prefix}[{dst_label}] {result}\n\n")
+            _append_realtime_segment(
+                realtime_segments,
+                [
+                    {"label": src_label, "text": src_text},
+                    {"label": dst_label, "text": result},
+                ],
+                time.monotonic() - session_started_at,
+                (asr_elapsed or 0) + (elapsed or 0),
+            )
             _webui_send({"type": "transcription", "source": source,
                          "src_lang": src_label, "src_text": src_text,
                          "dst_lang": dst_label, "dst_text": result,
@@ -7244,12 +7388,15 @@ def run_stream_bidirectional(lb_device_id, mic_device_id,
                 s.close()
             except Exception:
                 pass
+        p1 = ""
         if recorder_lb:
             p1 = recorder_lb.close()
             print(f"\n  {C_OK}錄音已儲存: {p1}{RESET}", flush=True)
+        p2 = ""
         if recorder_mic:
             p2 = recorder_mic.close()
             print(f"  {C_OK}錄音已儲存: {p2}{RESET}", flush=True)
+        video_path = ""
         if video_recorder:
             try:
                 print(f"{C_DIM}[DEBUG] bidi cleanup: 開始 finalize video{RESET}", flush=True)
@@ -7258,6 +7405,27 @@ def run_stream_bidirectional(lb_device_id, mic_device_id,
                 print(f"  {C_OK}錄影已儲存: {video_path}{RESET}", flush=True)
             except Exception as e:
                 print(f"  {C_HIGHLIGHT}[警告] 影片錄製或合併失敗: {e}{RESET}", flush=True)
+        package_info = _package_realtime_outputs(
+            log_path,
+            mode,
+            segments_data=realtime_segments,
+            audio_paths=[path for path in (p1, p2) if path],
+            video_path=video_path,
+            meeting_topic=meeting_topic,
+        )
+        _run_realtime_postprocess(
+            package_info["log_path"],
+            post_summary_mode,
+            post_summary_model,
+            post_llm_host,
+            post_llm_port,
+            post_llm_server_type or "ollama",
+            topic=meeting_topic,
+            audio_path=package_info["primary_media_path"] or p1,
+        )
+        if package_info["session_dir"]:
+            _webui_send_output_files([package_info["session_dir"]])
+            open_file_in_editor(package_info["session_dir"])
         if recorder_lb or recorder_mic:
             print(f"  {C_DIM}提示: 可再次執行本程式，選擇「讀入檔案」匯入錄音檔，產生逐字稿校正與 AI 摘要{RESET}", flush=True)
         return _still_active
@@ -7323,6 +7491,9 @@ def run_stream_bidirectional(lb_device_id, mic_device_id,
     print(f"\n{C_OK}{BOLD}開始監聽...{RESET} {C_OK}◀ 系統音訊（{_lb_dir}）{RESET}  {_listen_mic_hint}\n\n", flush=True)
     _webui_send({"type": "progress", "stage": "", "detail": ""})
     _webui_send({"type": "started", "mode": mode})
+
+    session_started_at = time.monotonic()
+    realtime_segments = []
 
     _tr_model = translator_lb.model if isinstance(translator_lb, OllamaTranslator) else ("NLLB" if isinstance(translator_lb, NllbTranslator) else "")
     _tr_loc = "伺服器" if isinstance(translator_lb, OllamaTranslator) else ("本機" if isinstance(translator_lb, NllbTranslator) else "")
@@ -9062,6 +9233,315 @@ def _ask_record_video():
 
     print(f"  {C_OK}→ 不錄製{RESET}\n")
     return False
+
+
+def _ask_realtime_postprocess(model_hint=None, host_hint=None, port_hint=None, server_type_hint=None):
+    """互動選單：詢問即時轉錄結束後是否自動做摘要/逐字稿校正。
+    回傳 (summary_mode, model, host, port, server_type)
+    summary_mode: None / "correct_only" / "both"""  # noqa: D401
+    default_idx = 0
+    options = [
+        ("不執行", None, "結束後只保留逐字稿"),
+        ("逐字稿校正", "correct_only", "結束後用 LLM 校正逐字稿"),
+        ("摘要 + 校正", "both", "結束後產生重點摘要並校正逐字稿"),
+    ]
+
+    print(f"\n\n{C_TITLE}{BOLD}▎ 轉錄後處理{RESET}")
+    print(f"{C_DIM}{'─' * 60}{RESET}")
+    for i, (label, _mode, desc) in enumerate(options):
+        if i == default_idx:
+            print(f"  {C_HIGHLIGHT}{BOLD}[{i}] {label:10s}{RESET} {C_WHITE}{desc}{RESET}  {C_HIGHLIGHT}{REVERSE} 預設 {RESET}")
+        else:
+            print(f"  {C_DIM}[{i}]{RESET} {C_WHITE}{label:10s}{RESET} {C_DIM}{desc}{RESET}")
+    print(f"{C_DIM}{'─' * 60}{RESET}")
+    print(f"{C_WHITE}按 Enter 使用預設，或輸入編號：{RESET}", end=" ")
+
+    try:
+        user_input = input().strip()
+    except (EOFError, KeyboardInterrupt):
+        print()
+        sys.exit(0)
+
+    idx = default_idx
+    if user_input:
+        try:
+            idx = int(user_input)
+            if not (0 <= idx < len(options)):
+                idx = default_idx
+        except ValueError:
+            idx = default_idx
+
+    summary_mode = options[idx][1]
+    if summary_mode is None:
+        print(f"  {C_OK}→ 不執行{RESET}\n")
+        return None, None, None, None, None
+
+    host = host_hint or OLLAMA_HOST
+    port = port_hint or OLLAMA_PORT
+    if not host:
+        print(f"  {C_HIGHLIGHT}[提醒] 尚未設定 LLM 伺服器，已略過轉錄後處理{RESET}\n")
+        return None, None, None, None, None
+
+    server_type = server_type_hint or _detect_llm_server(host, port)
+    if not server_type:
+        print(f"  {C_HIGHLIGHT}[提醒] 無法連接 LLM 伺服器（{host}:{port}），已略過轉錄後處理{RESET}\n")
+        return None, None, None, None, None
+
+    model = model_hint or SUMMARY_DEFAULT_MODEL
+    try:
+        _models = _llm_list_models(host, port, server_type)
+        if _models and model not in set(_models):
+            model = _models[0]
+    except Exception:
+        pass
+
+    _mode_label = "逐字稿校正" if summary_mode == "correct_only" else "摘要 + 校正"
+    print(f"  {C_OK}→ {_mode_label}{RESET}")
+    print(f"  {C_DIM}模型: {model} @ {host}:{port}{RESET}\n")
+    return summary_mode, model, host, port, server_type
+
+
+def _append_realtime_segment(segments_data, lines, end_sec, duration_hint=0.0,
+                             speaker=None):
+    """將即時輸出累積為近似可用的字幕 segment。"""
+    cleaned_lines = []
+    for line in lines or []:
+        if isinstance(line, dict):
+            text = str(line.get("text", "")).strip()
+            label = str(line.get("label", "")).strip()
+        else:
+            text = str(line).strip()
+            label = ""
+        if not text:
+            continue
+        cleaned_lines.append({"label": label, "text": text})
+    if not cleaned_lines:
+        return
+
+    if segments_data and segments_data[-1].get("lines") == cleaned_lines:
+        return
+
+    total_text_len = sum(len(item["text"]) for item in cleaned_lines)
+    duration = max(float(duration_hint or 0.0), 1.2)
+    duration = max(duration, min(max(total_text_len / 8.0, 1.2), 8.0))
+    end_sec = max(float(end_sec or 0.0), 0.0)
+    if end_sec <= 0:
+        end_sec = duration
+    start_sec = max(0.0, end_sec - duration)
+
+    if segments_data:
+        prev_end = max(float(segments_data[-1].get("end", 0.0) or 0.0), 0.0)
+        if start_sec < prev_end:
+            start_sec = prev_end
+        if end_sec <= start_sec:
+            end_sec = start_sec + max(0.8, min(duration, 4.0))
+
+    segment = {
+        "start": round(start_sec, 3),
+        "end": round(end_sec, 3),
+        "lines": cleaned_lines,
+    }
+    if speaker is not None:
+        segment["speaker"] = speaker
+    segments_data.append(segment)
+
+
+def _realtime_output_files_payload(session_dirs):
+    """整理 session 目錄中的可顯示輸出，供 WebUI 更新檔案列表。"""
+    root_dir = os.path.dirname(os.path.abspath(__file__))
+    output_files = []
+    rel_dirs = []
+    seen_dirs = set()
+    skip_audio_exts = {".wav", ".mp3", ".m4a", ".flac", ".ogg", ".wma", ".aac", ".opus"}
+
+    for session_dir in session_dirs or []:
+        if not session_dir or not os.path.isdir(session_dir):
+            continue
+        rel_dir = os.path.relpath(session_dir, root_dir)
+        if rel_dir not in seen_dirs:
+            rel_dirs.append(rel_dir)
+            seen_dirs.add(rel_dir)
+        for fname in sorted(os.listdir(session_dir)):
+            fpath = os.path.join(session_dir, fname)
+            if not os.path.isfile(fpath):
+                continue
+            ext = os.path.splitext(fname)[1].lower()
+            if ext in skip_audio_exts:
+                continue
+            output_files.append({
+                "name": fname,
+                "path": os.path.relpath(fpath, root_dir),
+            })
+
+    return output_files, rel_dirs
+
+
+def _webui_send_output_files(session_dirs):
+    output_files, rel_dirs = _realtime_output_files_payload(session_dirs)
+    if output_files or rel_dirs:
+        _webui_send({"type": "output_files", "files": output_files, "dirs": rel_dirs})
+
+
+def _unique_destination_path(path):
+    """若目標已存在，附加遞增尾碼避免覆蓋。"""
+    if not os.path.exists(path):
+        return path
+    base, ext = os.path.splitext(path)
+    index = 2
+    while True:
+        candidate = f"{base}_{index}{ext}"
+        if not os.path.exists(candidate):
+            return candidate
+        index += 1
+
+
+def _move_path_into_dir(path, session_dir):
+    """將檔案搬入 session 目錄；不存在時直接略過。"""
+    import shutil
+
+    if not path or not os.path.exists(path):
+        return ""
+    abs_path = os.path.abspath(path)
+    abs_session_dir = os.path.abspath(session_dir)
+    if os.path.dirname(abs_path) == abs_session_dir:
+        return abs_path
+
+    dst_path = _unique_destination_path(os.path.join(abs_session_dir, os.path.basename(abs_path)))
+    shutil.move(abs_path, dst_path)
+    return dst_path
+
+
+def _package_realtime_outputs(log_path, mode, segments_data=None, audio_paths=None,
+                              video_path="", meeting_topic=None):
+    """將即時模式輸出整理成離線模式相近的 session 資料夾。"""
+    result = {
+        "log_path": log_path or "",
+        "session_dir": "",
+        "audio_paths": [],
+        "video_path": "",
+        "primary_media_path": "",
+        "transcript_html_path": "",
+        "srt_path": "",
+        "vtt_path": "",
+    }
+
+    if not log_path or not os.path.isfile(log_path):
+        return result
+
+    log_dir = os.path.dirname(os.path.abspath(log_path))
+    log_stem = os.path.splitext(os.path.basename(log_path))[0]
+    session_dir = os.path.join(log_dir, log_stem)
+    if os.path.isfile(session_dir):
+        session_dir = _unique_destination_path(session_dir)
+    os.makedirs(session_dir, exist_ok=True)
+
+    moved_log_path = _move_path_into_dir(log_path, session_dir)
+    moved_audio_paths = []
+    for audio_path in audio_paths or []:
+        moved_audio = _move_path_into_dir(audio_path, session_dir)
+        if moved_audio:
+            moved_audio_paths.append(moved_audio)
+    moved_video_path = _move_path_into_dir(video_path, session_dir) if video_path else ""
+    primary_media_path = moved_video_path or (moved_audio_paths[0] if moved_audio_paths else "")
+
+    transcript_html_path = ""
+    srt_path = ""
+    vtt_path = ""
+    if segments_data:
+        base_no_ext = os.path.splitext(moved_log_path)[0]
+        srt_path = f"{base_no_ext}.srt"
+        vtt_path = f"{base_no_ext}.vtt"
+        _segments_to_srt(segments_data, srt_path)
+        _segments_to_vtt(segments_data, vtt_path)
+        if primary_media_path and os.path.exists(primary_media_path):
+            media_info = _ffprobe_info(primary_media_path)
+            media_duration = 0.0
+            if media_info and media_info[0] > 0:
+                media_duration = float(media_info[0])
+            elif segments_data:
+                media_duration = float(segments_data[-1].get("end", 0.0) or 0.0)
+            if media_duration > 0:
+                transcript_html_path = f"{base_no_ext}.html"
+                _transcript_to_html(
+                    segments_data,
+                    transcript_html_path,
+                    primary_media_path,
+                    media_duration,
+                    metadata={"meeting_topic": meeting_topic} if meeting_topic else None,
+                )
+
+    print(f"  {C_OK}已整理輸出目錄: {session_dir}{RESET}", flush=True)
+    if srt_path:
+        print(f"  {C_DIM}字幕: {srt_path}{RESET}", flush=True)
+    if vtt_path:
+        print(f"  {C_DIM}字幕: {vtt_path}{RESET}", flush=True)
+    if transcript_html_path:
+        print(f"  {C_DIM}逐字稿 HTML: {transcript_html_path}{RESET}", flush=True)
+
+    result.update({
+        "log_path": moved_log_path,
+        "session_dir": session_dir,
+        "audio_paths": moved_audio_paths,
+        "video_path": moved_video_path,
+        "primary_media_path": primary_media_path,
+        "transcript_html_path": transcript_html_path,
+        "srt_path": srt_path,
+        "vtt_path": vtt_path,
+    })
+    return result
+
+
+def _run_realtime_postprocess(log_path, summary_mode, model, host, port,
+                              server_type="ollama", topic=None, audio_path=""):
+    """即時模式結束後，針對本次逐字稿自動做摘要/校正。"""
+    print(f"{C_DIM}[DEBUG] _run_realtime_postprocess(log_path={log_path!r}, mode={summary_mode!r}, model={model!r}, host={host!r}, port={port!r}, server_type={server_type!r}){RESET}")
+    if not summary_mode:
+        print(f"{C_DIM}[DEBUG] 後處理未啟用，直接略過{RESET}")
+        _webui_send({"type": "progress", "stage": "轉錄後處理", "detail": "未啟用，略過"})
+        return
+    if not log_path or not os.path.isfile(log_path):
+        print(f"  {C_HIGHLIGHT}[提醒] 找不到逐字稿，已略過轉錄後處理{RESET}")
+        print(f"{C_DIM}[DEBUG] 略過原因: log_path 不存在或不是檔案{RESET}")
+        _webui_send({"type": "progress", "stage": "轉錄後處理", "detail": "找不到逐字稿，已略過"})
+        return
+    if not (model and host and port):
+        print(f"  {C_HIGHLIGHT}[提醒] 後處理設定不完整，已略過轉錄後處理{RESET}")
+        print(f"{C_DIM}[DEBUG] 略過原因: model/host/port 不完整{RESET}")
+        _webui_send({"type": "progress", "stage": "轉錄後處理", "detail": "設定不完整，已略過"})
+        return
+
+    print(f"\n\n{C_TITLE}{BOLD}▎ 轉錄後處理{RESET}")
+    print(f"{C_DIM}{'─' * 60}{RESET}")
+    _label = "逐字稿校正" if summary_mode == "correct_only" else "摘要 + 校正逐字稿"
+    print(f"  {C_DIM}模式: {_label}{RESET}")
+    print(f"  {C_DIM}模型: {model} @ {host}:{port}{RESET}")
+    _webui_send({"type": "progress", "stage": "轉錄後處理", "detail": f"開始 {_label}"})
+
+    metadata = {
+        "summary_model": model,
+        "summary_server": f"{('Ollama' if server_type == 'ollama' else 'OpenAI 相容')} @ {host}:{port}",
+        "meeting_topic": topic,
+    }
+    try:
+        out_path, _, html_path = summarize_log_file(
+            log_path, model, host, port,
+            server_type=server_type,
+            topic=topic,
+            metadata=metadata,
+            summary_mode=summary_mode,
+            audio_path=audio_path or "",
+        )
+        if out_path:
+            print(f"\n  {C_OK}已完成轉錄後處理{RESET}")
+            print(f"  {C_WHITE}{out_path}{RESET}")
+            _webui_send({"type": "progress", "stage": "轉錄後處理", "detail": "已完成"})
+            if html_path:
+                print(f"  {C_WHITE}{html_path}{RESET}")
+                open_file_in_editor(html_path)
+            open_file_in_editor(out_path)
+    except Exception as e:
+        print(f"  {C_HIGHLIGHT}[警告] 轉錄後處理失敗: {e}{RESET}")
+        _webui_send({"type": "progress", "stage": "轉錄後處理", "detail": f"失敗: {e}"})
 
 
 def open_file_in_editor(file_path):
@@ -12698,6 +13178,15 @@ def parse_args():
         "--summary-rounds", type=int, metavar="N", default=1,
         help="摘要處理次數（1-3，多次處理後整合可提升品質，預設 1）")
     parser.add_argument(
+        "--post-summary-mode", choices=["correct_only", "both"], metavar="MODE",
+        help="即時模式結束後處理（correct_only=僅校正逐字稿，both=摘要+校正）")
+    parser.add_argument(
+        "--post-summary-model", metavar="MODEL", default=None,
+        help="即時模式結束後處理使用的 LLM 模型（預設同 --summary-model）")
+    parser.add_argument(
+        "--post-llm-host", metavar="HOST",
+        help="即時模式結束後處理使用的 LLM 位址（可覆蓋 --llm-host，例如 192.168.1.40:11434）")
+    parser.add_argument(
         "--diarize", action="store_true",
         help="講者辨識（需搭配 --input，用 resemblyzer + spectralcluster）")
     parser.add_argument(
@@ -12780,6 +13269,23 @@ def _resolve_ollama_host(args):
                 pass  # 保持預設 port
         else:
             host = args.ollama_host
+    return host, port
+
+
+def _resolve_post_llm_host(args, fallback_host, fallback_port):
+    """解析即時後處理 LLM 位址，未指定時沿用 fallback。"""
+    host, port = fallback_host, fallback_port
+    post_host = getattr(args, "post_llm_host", None)
+    if post_host:
+        if ":" in post_host:
+            parts = post_host.rsplit(":", 1)
+            host = parts[0]
+            try:
+                port = int(parts[1])
+            except ValueError:
+                pass
+        else:
+            host = post_host
     return host, port
 
 
@@ -13689,6 +14195,12 @@ def main():
     if cli_mode:
         # CLI 模式：用參數 + 預設值，跳過選單
         mode = args.mode or "en2zh"
+        cli_post_mode = getattr(args, "post_summary_mode", None)
+        cli_post_model = (getattr(args, "post_summary_model", None)
+                          or args.summary_model
+                          or SUMMARY_DEFAULT_MODEL)
+        _cli_post_host_dbg, _cli_post_port_dbg = _resolve_post_llm_host(args, OLLAMA_HOST, OLLAMA_PORT)
+        print(f"{C_DIM}[DEBUG] CLI 後處理設定: mode={cli_post_mode or 'off'}, model={cli_post_model or '-'}, host={_cli_post_host_dbg or '-'}:{_cli_post_port_dbg}{RESET}")
 
         # 純錄音模式：跳過 ASR，直接錄音
         if mode == "record":
@@ -13786,6 +14298,8 @@ def main():
             if not _confirm_start(_build_cli_command(**_cli_kw)):
                 sys.exit(0)
             print()
+            _post_host, _post_port = _resolve_post_llm_host(args, host, port)
+            _post_srv = _detect_llm_server(_post_host, _post_port) or "ollama"
             run_stream_bidirectional(_bidi_lb_id, _bidi_mic_id,
                                      translator_lb, translator_mic,
                                      model_name, mode,
@@ -13794,7 +14308,12 @@ def main():
                                      record_video=args.record_video, video_device=args.video_device,
                                      meeting_topic=meeting_topic,
                                      use_mlx=_use_mlx_bidi,
-                                     denoise=args.denoise)
+                                     denoise=args.denoise,
+                                     post_summary_mode=cli_post_mode,
+                                     post_summary_model=cli_post_model,
+                                     post_llm_host=_post_host,
+                                     post_llm_port=_post_port,
+                                     post_llm_server_type=_post_srv)
             sys.exit(0)
 
         # --mic 衝突檢查
@@ -13893,13 +14412,20 @@ def main():
             if not _confirm_start(_build_cli_command(**_cli_kw)):
                 sys.exit(0)
             print()
+            _post_host, _post_port = _resolve_post_llm_host(args, host, port)
+            _post_srv = _detect_llm_server(_post_host, _post_port) or "ollama"
             run_stream_remote(capture_id, translator, model_name, REMOTE_WHISPER_CONFIG,
                               mode, length_ms, step_ms,
                               record=args.record, rec_device=args.rec_device,
                               record_video=args.record_video, video_device=args.video_device,
                               force_restart=args.restart_server,
                               meeting_topic=meeting_topic,
-                              denoise=args.denoise)
+                              denoise=args.denoise,
+                              post_summary_mode=cli_post_mode,
+                              post_summary_model=cli_post_model,
+                              post_llm_host=_post_host,
+                              post_llm_port=_post_port,
+                              post_llm_server_type=_post_srv)
         elif asr_engine == "moonshine":
             check_dependencies(asr_engine)
             # Moonshine 模式
@@ -14070,6 +14596,8 @@ def main():
                     elif not _use_mlx:
                         # 有 GPU 但不是 mlx，提示引擎切換
                         print(f"\n{C_DIM}--mic 模式：ASR 引擎切換為 faster-whisper 雙路辨識{RESET}")
+                    _post_host, _post_port = _resolve_post_llm_host(args, host, port)
+                    _post_srv = _detect_llm_server(_post_host, _post_port) or "ollama"
                     run_stream_bidirectional(_mic_lb_id, _mic_mic_id,
                                              translator, None,
                                              _mic_model, mode,
@@ -14079,20 +14607,39 @@ def main():
                                              meeting_topic=meeting_topic,
                                              use_mlx=_use_mlx,
                                              mic_translate=False,
-                                             denoise=args.denoise)
+                                             denoise=args.denoise,
+                                             post_summary_mode=cli_post_mode,
+                                             post_summary_model=cli_post_model,
+                                             post_llm_host=_post_host,
+                                             post_llm_port=_post_port,
+                                             post_llm_server_type=_post_srv)
                     sys.exit(0)
             if _cli_use_local_fw:
+                _post_host, _post_port = _resolve_post_llm_host(args, host, port)
+                _post_srv = _detect_llm_server(_post_host, _post_port) or "ollama"
                 run_stream_local_whisper(capture_id, translator, model_name, mode,
                                         length_ms=length_ms, step_ms=step_ms,
                                         record=args.record, rec_device=args.rec_device,
                                         record_video=args.record_video, video_device=args.video_device,
                                         meeting_topic=meeting_topic,
-                                        denoise=args.denoise)
+                                        denoise=args.denoise,
+                                        post_summary_mode=cli_post_mode,
+                                        post_summary_model=cli_post_model,
+                                        post_llm_host=_post_host,
+                                        post_llm_port=_post_port,
+                                        post_llm_server_type=_post_srv)
             else:
+                _post_host, _post_port = _resolve_post_llm_host(args, host, port)
+                _post_srv = _detect_llm_server(_post_host, _post_port) or "ollama"
                 run_stream(capture_id, translator, model_name, model_path, length_ms, step_ms, mode,
                            record=args.record, rec_device=args.rec_device,
                            record_video=args.record_video, video_device=args.video_device,
-                           meeting_topic=meeting_topic)
+                           meeting_topic=meeting_topic,
+                           post_summary_mode=cli_post_mode,
+                           post_summary_model=cli_post_model,
+                           post_llm_host=_post_host,
+                           post_llm_port=_post_port,
+                           post_llm_server_type=_post_srv)
     else:
         # 互動式選單
         mode = select_mode()
@@ -14154,6 +14701,13 @@ def main():
                 print(f"  {C_WHITE}請使用 LLM 伺服器或 NLLB 離線翻譯{RESET}")
                 sys.exit(1)
 
+            _post_mode, _post_model, _post_host, _post_port, _post_srv = _ask_realtime_postprocess(
+                model_hint=model if engine == "llm" else SUMMARY_DEFAULT_MODEL,
+                host_hint=host if engine == "llm" else OLLAMA_HOST,
+                port_hint=port if engine == "llm" else OLLAMA_PORT,
+                server_type_hint=srv_type if engine == "llm" else None,
+            )
+
             # 錄音
             record_bidi = False
             try:
@@ -14186,7 +14740,12 @@ def main():
                                      record_video=record_video, video_device=args.video_device,
                                      meeting_topic=meeting_topic,
                                      use_mlx=_use_mlx_bidi,
-                                     denoise=args.denoise)
+                                     denoise=args.denoise,
+                                     post_summary_mode=_post_mode,
+                                     post_summary_model=_post_model,
+                                     post_llm_host=_post_host,
+                                     post_llm_port=_post_port,
+                                     post_llm_server_type=_post_srv)
             sys.exit(0)
 
         # 轉錄模式：提前詢問麥克風轉錄（影響辨識位置預設值）
@@ -14213,6 +14772,11 @@ def main():
 
         if use_remote_asr:
             # ── GPU 伺服器 路徑：固定 Whisper，跳過引擎/場景選擇 ──
+            engine = None
+            model = None
+            host = OLLAMA_HOST
+            port = OLLAMA_PORT
+            srv_type = None
 
             # 伺服器 Whisper 模型選擇（帶快取標籤）
             r_model_name = select_whisper_model_remote(mode)
@@ -14248,6 +14812,13 @@ def main():
             # 錄影
             record_video = _ask_record_video()
 
+            _post_mode, _post_model, _post_host, _post_port, _post_srv = _ask_realtime_postprocess(
+                model_hint=model if (mode in _TRANSLATE_MODES and engine == "llm") else SUMMARY_DEFAULT_MODEL,
+                host_hint=host if (mode in _TRANSLATE_MODES and engine == "llm") else OLLAMA_HOST,
+                port_hint=port if (mode in _TRANSLATE_MODES and engine == "llm") else OLLAMA_PORT,
+                server_type_hint=srv_type if (mode in _TRANSLATE_MODES and engine == "llm") else None,
+            )
+
             # 音訊裝置（PortAudio，不是 SDL2）
             capture_id = list_audio_devices_sd()
 
@@ -14267,7 +14838,12 @@ def main():
                               record_video=record_video, video_device=args.video_device,
                               force_restart=args.restart_server,
                               meeting_topic=meeting_topic,
-                              denoise=args.denoise)
+                              denoise=args.denoise,
+                              post_summary_mode=_post_mode,
+                              post_summary_model=_post_model,
+                              post_llm_host=_post_host,
+                              post_llm_port=_post_port,
+                              post_llm_server_type=_post_srv)
         else:
             # ── 本機路徑：既有流程 ──
 
@@ -14342,6 +14918,16 @@ def main():
             # 錄影（Moonshine 暫不支援）
             record_video = _ask_record_video() if asr_engine == "whisper" else False
 
+            _post_mode = _post_model = _post_host = _post_port = _post_srv = None
+            if asr_engine == "whisper":
+                _need_llm = mode in _TRANSLATE_MODES and engine == "llm"
+                _post_mode, _post_model, _post_host, _post_port, _post_srv = _ask_realtime_postprocess(
+                    model_hint=model if _need_llm else SUMMARY_DEFAULT_MODEL,
+                    host_hint=host if _need_llm else OLLAMA_HOST,
+                    port_hint=port if _need_llm else OLLAMA_PORT,
+                    server_type_hint=srv_type if _need_llm else None,
+                )
+
             # 詢問是否同時轉錄麥克風
             use_mic = False
             bidi_devs = _early_bidi_devs  # 轉錄模式已提前偵測
@@ -14397,6 +14983,8 @@ def main():
                                    mic=True, denoise=args.denoise)
                     if not _confirm_start(_build_cli_command(**_cli_kw)):
                         sys.exit(0)
+                    _post_host, _post_port = _resolve_post_llm_host(args, host, port)
+                    _post_srv = _detect_llm_server(_post_host, _post_port) or "ollama"
                     run_stream_bidirectional(_mic_lb_id, _mic_mic_id,
                                              translator, None,
                                              _mic_model, mode,
@@ -14406,27 +14994,38 @@ def main():
                                              meeting_topic=meeting_topic,
                                              use_mlx=_use_mlx_mic,
                                              mic_translate=False,
-                                             denoise=args.denoise)
+                                             denoise=args.denoise,
+                                             post_summary_mode=cli_post_mode,
+                                             post_summary_model=cli_post_model,
+                                             post_llm_host=_post_host,
+                                             post_llm_port=_post_port,
+                                             post_llm_server_type=_post_srv)
                 elif _use_local_fw:
                     # Windows WASAPI + faster-whisper 本機辨識
-                    capture_id = list_audio_devices_sd()
                     _need_llm = mode in _TRANSLATE_MODES and engine == "llm"
+                    capture_id = list_audio_devices_sd()
                     _cli_kw = dict(mode=mode, model=model_name,
                                    device=capture_id, topic=meeting_topic,
                                    record=record, rec_device=rec_device,
-                                   record_video=record_video,
                                    engine=engine if mode in _TRANSLATE_MODES else None,
                                    llm_model=model if _need_llm else None,
                                    llm_host=f"{host}:{port}" if _need_llm else None,
                                    denoise=args.denoise)
                     if not _confirm_start(_build_cli_command(**_cli_kw)):
                         sys.exit(0)
+                    _post_host, _post_port = _resolve_post_llm_host(args, host, port)
+                    _post_srv = _detect_llm_server(_post_host, _post_port) or "ollama"
                     run_stream_local_whisper(capture_id, translator, model_name, mode,
-                                            length_ms=length_ms, step_ms=step_ms,
-                                            record=record, rec_device=rec_device,
-                                            record_video=record_video, video_device=args.video_device,
-                                            meeting_topic=meeting_topic,
-                                            denoise=args.denoise)
+                                             length_ms=length_ms, step_ms=step_ms,
+                                             record=record, rec_device=rec_device,
+                                             record_video=record_video, video_device=args.video_device,
+                                             meeting_topic=meeting_topic,
+                                             denoise=args.denoise,
+                                             post_summary_mode=cli_post_mode,
+                                             post_summary_model=cli_post_model,
+                                             post_llm_host=_post_host,
+                                             post_llm_port=_post_port,
+                                             post_llm_server_type=_post_srv)
                 else:
                     capture_id = list_audio_devices(model_path)
                     _need_llm = mode in _TRANSLATE_MODES and engine == "llm"
@@ -14439,10 +15038,17 @@ def main():
                                    llm_host=f"{host}:{port}" if _need_llm else None)
                     if not _confirm_start(_build_cli_command(**_cli_kw)):
                         sys.exit(0)
+                    _post_host, _post_port = _resolve_post_llm_host(args, host, port)
+                    _post_srv = _detect_llm_server(_post_host, _post_port) or "ollama"
                     run_stream(capture_id, translator, model_name, model_path, length_ms, step_ms, mode,
                                record=record, rec_device=rec_device,
                                record_video=record_video, video_device=args.video_device,
-                               meeting_topic=meeting_topic)
+                               meeting_topic=meeting_topic,
+                               post_summary_mode=cli_post_mode,
+                               post_summary_model=cli_post_model,
+                               post_llm_host=_post_host,
+                               post_llm_port=_post_port,
+                               post_llm_server_type=_post_srv)
 
 
 if __name__ == "__main__":

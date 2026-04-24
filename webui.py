@@ -336,6 +336,7 @@ def _start_proc(args: list):
             popen_kwargs["creationflags"] = subprocess.CREATE_NEW_PROCESS_GROUP
         else:
             popen_kwargs["start_new_session"] = True
+        print(f"[WebUI] 啟動主程式參數: {' '.join(args)}", flush=True)
         _proc = subprocess.Popen(cmd, **popen_kwargs)
         _proc._start_time = time.monotonic()
         print(f"[WebUI] 主程式日誌: {_proc_log_path}", flush=True)
@@ -940,6 +941,19 @@ def _build_args(body: dict) -> list:
         sr = body.get("summary_rounds", 1)
         if sr and int(sr) > 1:
             args.extend(["--summary-rounds", str(int(sr))])
+    post_summary_mode = (body.get("post_summary_mode")
+                         or body.get("realtime_post_summary_mode")
+                         or "").strip()
+    if post_summary_mode and post_summary_mode != "off":
+        args.extend(["--post-summary-mode", post_summary_mode])
+        post_summary_model = (body.get("post_summary_model")
+                              or body.get("realtime_post_summary_model")
+                              or "").strip()
+        if post_summary_model:
+            args.extend(["--post-summary-model", post_summary_model])
+        post_llm_host = (body.get("post_llm_host") or body.get("llm_host") or "").strip()
+        if post_llm_host:
+            args.extend(["--post-llm-host", post_llm_host])
     if body.get("local_asr"):
         args.append("--local-asr")
     if body.get("no_srt"):
@@ -982,6 +996,8 @@ async def api_start(request: Request, body: dict = {}):
             "summarize": body.get("summarize", False),
             "summary_model": body.get("summary_model", ""),
             "summary_rounds": body.get("summary_rounds", 1),
+            "realtime_post_summary_mode": body.get("post_summary_mode", ""),
+            "realtime_post_summary_model": body.get("post_summary_model", ""),
             "gen_srt": not body.get("no_srt", False),
             "gen_vtt": not body.get("no_vtt", False),
         }

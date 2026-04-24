@@ -1,45 +1,51 @@
 {
-  "copyright_notice": "Copyright (c) 2026 貓又CatAgain (modified parts)",
-  "llm_host": "127.0.0.1",
-  "llm_port": 11434,
-  "last_llm_model": "gemma4:latest",
-  "last_rec_choice": "1",
-  "last_summary_model": "gpt-oss:120b",
-  "subtitle_overlay": {
-    "enabled": true,
-    "font_family": "",
-    "opacity": 65,
-    "click_through": true,
-    "single_line": false,
-    "x": 460,
-    "y": 978,
-    "font_preset": "medium"
-  },
-  "webui_last": {
-    "mode": "zh",
-    "model": "large-v3-turbo",
-    "scene": "subtitle",
-    "engine": "llm",
-    "llm_model": "gemma4:latest",
-    "llm_host": "127.0.0.1:11434",
-    "local_asr": true,
-    "record": true,
-    "mic": true,
-    "record_video": true,
-    "video_device": "",
-    "denoise": true,
-    "diarize": false,
-    "num_speakers": 0,
-    "summarize": false,
-    "summary_model": "",
-    "summary_rounds": 1,
-    "gen_srt": true,
-    "gen_vtt": true
-  },
-  "subtitle_forward": {
-    "enabled": false
-  },
-  "keyword_alert": {
-    "enabled": false
-  }
+    "copyright_notice": "Copyright (c) 2026 貓又CatAgain (modified parts)",
+    "llm_host": "127.0.0.1",
+    "llm_port": 11434,
+    "last_llm_model": "qwen2.5:14b",
+    "last_rec_choice": "1",
+    "last_summary_model": "gpt-oss:120b",
+    "subtitle_overlay": {
+        "enabled": true,
+        "font_family": "",
+        "opacity": 65,
+        "click_through": true,
+        "single_line": false,
+        "x": 460,
+        "y": 978,
+        "font_preset": "medium"
+    },
+    "webui_last": {
+        "mode": "zh",
+        "model": "large-v3-turbo",
+        "scene": "subtitle",
+        "engine": "llm",
+        "llm_model": "gemma4:latest",
+        "llm_host": "127.0.0.1:11434",
+        "local_asr": true,
+        "record": true,
+        "mic": true,
+        "record_video": true,
+        "video_device": "",
+        "denoise": true,
+        "diarize": false,
+        "num_speakers": 0,
+        "summarize": false,
+        "summary_model": "",
+        "summary_rounds": 1,
+        "realtime_post_summary_mode": "both",
+        "realtime_post_summary_model": "qwen2.5:14b",
+        "gen_srt": true,
+        "gen_vtt": true
+    },
+    "subtitle_forward": {
+        "enabled": false
+    },
+    "keyword_alert": {
+        "enabled": false
+    },
+    "webui_passwords": {
+        "read": "123456",
+        "admin": "654321"
+    }
 }
