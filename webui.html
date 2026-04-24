@@ -175,6 +175,8 @@ kbd{display:inline-block;font-family:inherit;font-size:10px;padding:1px 5px;bord
 .mode-toggle kbd{border-color:var(--border);background:var(--bg3);color:var(--text-dim)}.mode-toggle.active kbd{border-color:rgba(255,255,255,.3);background:rgba(255,255,255,.15);color:#fff}
 .new-btn{background:var(--accent);color:#fff;border:none;padding:5px 14px;border-radius:16px;font-size:12px;cursor:pointer;display:none;position:absolute;left:50%;transform:translateX(-50%)}.new-btn.vis{display:inline-block}
 .bar-info{font-size:12px;color:var(--text-dim);margin-left:6px;display:inline-flex;align-items:center;gap:6px}
+.bar-info-label{font-size:12px;color:var(--text-dim);font-weight:700;margin-left:10px}
+.progress-info{min-width:280px;max-width:48vw;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
 #bInfo:not(:empty)::before{content:'';width:14px;height:14px;border:2px solid var(--border);border-top-color:var(--accent);border-radius:50%;animation:spin .8s linear infinite;flex-shrink:0}
 .disc-msg{text-align:center;padding:20px 24px;color:var(--text);font-size:14px;border:1px solid var(--border);border-radius:var(--radius);margin:16px auto;max-width:420px;background:var(--bg3);line-height:1.8}
 .disc-msg .disc-title{font-weight:600;margin-bottom:8px;font-size:15px}
@@ -466,7 +468,7 @@ kbd{display:inline-block;font-family:inherit;font-size:10px;padding:1px 5px;bord
     <div class="sbar-right"><span id="sCount">0 句</span><div class="vol-bar" id="volBar"></div></div>
   </div>
   <div class="msgs" id="msgs"></div>
-  <div class="bar"><div><button class="stop-btn" id="stopBtn" onclick="stop()">停止 <kbd>S</kbd></button><button class="stop-btn" id="pauseBtn" onclick="togglePause()" style="background:var(--orange);margin-left:8px">暫停 <kbd>P</kbd></button><span class="bar-info" id="bInfo"></span><span class="bar-info" id="bDevices" style="margin-left:8px"></span><span id="bBarBadges" style="margin-left:8px;display:inline-flex;gap:4px"><span class="sbadge sbadge-rec" id="bRec" style="display:none"><svg viewBox="0 0 24 24"><circle cx="12" cy="12" r="6" fill="currentColor" stroke="none"/></svg>錄音中</span><span class="sbadge" id="bRecVideo" style="display:none;background:rgba(102,16,242,.12);color:#7b3fe4"><svg viewBox="0 0 24 24" style="width:12px;height:12px;stroke:currentColor;fill:none;stroke-width:1.5"><rect x="3" y="6" width="13" height="12" rx="2"/><path d="M16 10l5-3v10l-5-3z" stroke-linejoin="round"/></svg>錄影中</span><span class="sbadge sbadge-denoise" id="bDenoise" style="display:none"><svg viewBox="0 0 24 24"><path d="M2 12C2 6.5 6.5 2 12 2M22 12C22 17.5 17.5 22 12 22M8 12C8 9.8 9.8 8 12 8M16 12C16 14.2 14.2 16 12 16" stroke="currentColor" stroke-linecap="round"/></svg>降噪</span><span class="sbadge" id="bOvReopen" style="display:none;background:rgba(0,188,212,.12);color:#00bcd4;cursor:pointer" onclick="reopenOverlay()" title="重新開啟懸浮字幕視窗"><svg viewBox="0 0 24 24" style="width:12px;height:12px;stroke:currentColor;fill:none;stroke-width:1.5"><rect x="2" y="4" width="20" height="16" rx="2"/><path d="M6 14h4M11 14h7M6 18h12" stroke-linecap="round"/></svg>懸浮字幕</span></span></div><div><button class="mode-toggle" id="subBtn" onclick="toggleSubMode()">字幕模式 <kbd>T</kbd></button><button class="new-btn" id="newBtn" onclick="toEnd()">新訊息 ↓</button></div></div>
+  <div class="bar"><div><button class="stop-btn" id="stopBtn" onclick="stop()">停止 <kbd>S</kbd></button><button class="stop-btn" id="pauseBtn" onclick="togglePause()" style="background:var(--orange);margin-left:8px">暫停 <kbd>P</kbd></button><span class="bar-info-label">進度</span><span class="bar-info progress-info" id="bInfo">待命</span><span class="bar-info" id="bDevices" style="margin-left:8px"></span><span id="bBarBadges" style="margin-left:8px;display:inline-flex;gap:4px"><span class="sbadge sbadge-rec" id="bRec" style="display:none"><svg viewBox="0 0 24 24"><circle cx="12" cy="12" r="6" fill="currentColor" stroke="none"/></svg>錄音中</span><span class="sbadge" id="bRecVideo" style="display:none;background:rgba(102,16,242,.12);color:#7b3fe4"><svg viewBox="0 0 24 24" style="width:12px;height:12px;stroke:currentColor;fill:none;stroke-width:1.5"><rect x="3" y="6" width="13" height="12" rx="2"/><path d="M16 10l5-3v10l-5-3z" stroke-linejoin="round"/></svg>錄影中</span><span class="sbadge sbadge-denoise" id="bDenoise" style="display:none"><svg viewBox="0 0 24 24"><path d="M2 12C2 6.5 6.5 2 12 2M22 12C22 17.5 17.5 22 12 22M8 12C8 9.8 9.8 8 12 8M16 12C16 14.2 14.2 16 12 16" stroke="currentColor" stroke-linecap="round"/></svg>降噪</span><span class="sbadge" id="bOvReopen" style="display:none;background:rgba(0,188,212,.12);color:#00bcd4;cursor:pointer" onclick="reopenOverlay()" title="重新開啟懸浮字幕視窗"><svg viewBox="0 0 24 24" style="width:12px;height:12px;stroke:currentColor;fill:none;stroke-width:1.5"><rect x="2" y="4" width="20" height="16" rx="2"/><path d="M6 14h4M11 14h7M6 18h12" stroke-linecap="round"/></svg>懸浮字幕</span></span></div><div><button class="mode-toggle" id="subBtn" onclick="toggleSubMode()">字幕模式 <kbd>T</kbd></button><button class="new-btn" id="newBtn" onclick="toEnd()">新訊息 ↓</button></div></div>
 </div>
 <script>
 const $=id=>document.getElementById(id),msgsEl=$('msgs'),dot=$('dot'),newBtn=$('newBtn');
@@ -828,8 +830,7 @@ async function openOutputFolder(){
 function showDisconnected(msg){
   _stopBusy=false;_stopConfirm=false;
   stopTimer();dot.classList.remove('on');
-  // 清空底部狀態列（停止 spinner）
-  $('bInfo').textContent='';
+  $('bInfo').textContent='待命';
   const d=document.createElement('div');d.className='disc-msg';
   let h='<div class="disc-title">'+esc(msg)+'</div>';
   if(_outputFiles.length){
@@ -878,7 +879,7 @@ function showDisconnected(msg){
 let _msgQueue=[],_msgTimer=null;
 function _flushMsgs(){_msgTimer=null;while(_msgQueue.length){_renderMsg(_msgQueue.shift())}}
 function addMsg(ev){_msgQueue.push(ev);if(!_msgTimer)_msgTimer=setTimeout(_flushMsgs,80)}
-function _renderMsg(ev){dot.classList.add('on');if(cnt===0)$('bInfo').textContent='';cnt++;$('sCount').textContent=cnt+' 句';if(ev.rms!=null)pushVol(ev.rms);const isO=(ev.source==='loopback'||ev.source==='main');const d=document.createElement('div');d.className='m '+(isO?'o':'s');
+function _renderMsg(ev){dot.classList.add('on');cnt++;$('sCount').textContent=cnt+' 句';if(ev.rms!=null)pushVol(ev.rms);const isO=(ev.source==='loopback'||ev.source==='main');const d=document.createElement('div');d.className='m '+(isO?'o':'s');
   let asrBadge=ev.asr_time!=null?'<span class="b '+bc(ev.asr_time)+'">辨 '+ev.asr_time+'s</span> ':'';
   let trBadge=ev.translate_time!=null?'<span class="b '+bc(ev.translate_time)+'">譯 '+ev.translate_time+'s</span> ':'';
   const spkHtml=ev.speaker?'<div><span class="m-spk" style="background:'+_spkColors[(ev.speaker-1)%8]+'">Speaker '+ev.speaker+'</span></div>':'';
@@ -907,7 +908,7 @@ function conn(){
       if(ev.type==='transcription')addMsg(ev);
       else if(ev.type==='started'){curCfg.modeLabel=_modeLabels[ev.mode]||ev.mode;curCfg.mode=ev.mode;if(!_isSwitching){showLive()}dot.classList.add('on')}
       else if(ev.type==='stopped'&&!_isSwitching){_stopBusy=false;showSetup();}
-      else if(ev.type==='disconnected'){if(_isSwitching)return;dot.classList.remove('on');showDisconnected(ev.message||'主程式已結束')}
+      else if(ev.type==='disconnected'){if(_isSwitching)return;dot.classList.remove('on');const _msg=ev.message||'主程式已結束';if(_msg==='處理已完成'){_stopBusy=false;showSetup()}else showDisconnected(_msg)}
       else if(ev.type==='switching'){$('bInfo').textContent=ev.message||'切換中...'}
       else if(ev.type==='pause_state'){_applyPauseState(!!ev.paused);$('bInfo').textContent=ev.paused?'已暫停':'已繼續'}
       else if(ev.type==='rms'&&ev.value!=null)pushVol(ev.value);
@@ -1309,7 +1310,7 @@ async function switchDevice(type,deviceId,deviceName){
       if(isLb){_lastStartBody.device=deviceId;_curDeviceId=deviceId;_autoLb=deviceName}
       else{_lastStartBody.mic_device=deviceId;_curMicDeviceId=deviceId;_autoMic=deviceName}
       if(badge){badge.classList.remove('switching');const nm=badge.querySelector('.dev-name');if(nm)nm.textContent=deviceName}
-      $('bInfo').textContent='';
+      $('bInfo').textContent='待命';
       showToast(label+'已切換為 '+deviceName,'ok');
       const info=document.createElement('div');info.style.cssText='text-align:center;padding:8px;font-size:12px;color:var(--text-dim)';info.textContent='— '+label+'已切換為 '+deviceName+' —';msgsEl.appendChild(info);
     }else{showToast('切換失敗: '+(d.error||''),'err');if(badge)badge.classList.remove('switching')}

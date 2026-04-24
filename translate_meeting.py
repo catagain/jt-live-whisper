@@ -856,12 +856,21 @@ _keyword_monitor = None     # KeywordMonitor 實例（啟用時才建立）
 def _webui_send(event: dict):
     """非阻塞推送事件到 WebUI（未啟用時直接返回）"""
     if _webui_queue is not None:
+        import queue as _q
         try:
             # 清理 UTF-8 replacement character
             for k in ("src_text", "dst_text", "detail"):
                 if k in event and isinstance(event[k], str):
                     event[k] = event[k].replace("\ufffd", "")
             _webui_queue.put_nowait(event)
+        except _q.Full:
+            # 佇列滿時優先保留關鍵進度事件；逐字稿事件可被丟棄。
+            if event.get("type") != "transcription":
+                try:
+                    _webui_queue.get_nowait()  # 釋出一格（通常是舊的逐字稿事件）
+                    _webui_queue.put_nowait(event)
+                except Exception:
+                    pass
         except Exception:
             pass
     # 字幕轉發：餵入即時辨識結果
@@ -870,6 +879,12 @@ def _webui_send(event: dict):
     # 關鍵字通知：檢查是否匹配
     if event.get("type") == "transcription" and _keyword_monitor is not None:
         _keyword_monitor.check(event)
+
+
+def _debug_progress(message: str, stage: str = "正在停止"):
+    """輸出 DEBUG 訊息，並同步到 WebUI 進度列。"""
+    print(f"{C_DIM}[DEBUG] {message}{RESET}", flush=True)
+    _webui_send({"type": "progress", "stage": stage, "detail": message})
 
 
 def _start_webui_sender():
@@ -2472,8 +2487,51 @@ def _llm_generate(prompt, model, host, port, server_type, stream=False,
         headers={"Content-Type": "application/json"},
     )
 
+    def _open_with_retry(_req, _timeout):
+        """呼叫 LLM API（遇到暫時性錯誤時自動重試）"""
+        max_attempts = 3
+        last_exc = None
+        for attempt in range(1, max_attempts + 1):
+            try:
+                return urllib.request.urlopen(_req, timeout=_timeout)
+            except urllib.error.HTTPError as e:
+                last_exc = e
+                status = getattr(e, "code", 0)
+                body_text = ""
+                try:
+                    body_text = e.read().decode("utf-8", errors="replace").strip()
+                except Exception:
+                    pass
+                is_retryable = status in (500, 502, 503, 504)
+                if is_retryable and attempt < max_attempts:
+                    wait_sec = 1.5 * attempt
+                    msg = f"LLM 伺服器暫時錯誤 HTTP {status}，{wait_sec:.1f}s 後重試（{attempt}/{max_attempts - 1}）"
+                    if spinner:
+                        spinner.set_task(msg, reset_timer=False)
+                    print(f"  {C_HIGHLIGHT}[警告] {msg}{RESET}")
+                    time.sleep(wait_sec)
+                    continue
+                detail = f"HTTP {status}"
+                if body_text:
+                    detail += f": {body_text[:500]}"
+                raise RuntimeError(f"LLM API 呼叫失敗（{detail}）") from e
+            except Exception as e:
+                last_exc = e
+                if attempt < max_attempts:
+                    wait_sec = 1.0 * attempt
+                    msg = f"LLM 連線異常，{wait_sec:.1f}s 後重試（{attempt}/{max_attempts - 1}）"
+                    if spinner:
+                        spinner.set_task(msg, reset_timer=False)
+                    print(f"  {C_HIGHLIGHT}[警告] {msg}: {e}{RESET}")
+                    time.sleep(wait_sec)
+                    continue
+                raise RuntimeError(f"LLM API 呼叫失敗（{e}）") from e
+        if last_exc:
+            raise RuntimeError(f"LLM API 呼叫失敗（{last_exc}）") from last_exc
+        raise RuntimeError("LLM API 呼叫失敗（未知錯誤）")
+
     if not stream:
-        with urllib.request.urlopen(req, timeout=timeout) as resp:
+        with _open_with_retry(req, timeout) as resp:
             result = json.loads(resp.read())
             if server_type == "openai":
                 return result["choices"][0]["message"]["content"].strip()
@@ -2484,7 +2542,7 @@ def _llm_generate(prompt, model, host, port, server_type, stream=False,
     response_text = ""
     token_count = 0
     line_buf = ""  # live_output 行緩衝（用於 markdown 著色）
-    with urllib.request.urlopen(req, timeout=timeout) as resp:
+    with _open_with_retry(req, timeout) as resp:
         if server_type == "openai":
             # SSE 格式：data: {...}\n\n
             for raw_line in resp:
@@ -4197,7 +4255,7 @@ def run_stream(capture_id: int, translator, model_name: str, model_path: str,
     def signal_handler(signum, frame):
         now = time.monotonic()
         _sigint_count_ws[0] += 1
-        print(f"\n{C_DIM}[DEBUG] 收到停止訊號 {signum}（第 {_sigint_count_ws[0]} 次）{RESET}", flush=True)
+        _debug_progress(f"收到停止訊號 {signum}（第 {_sigint_count_ws[0]} 次）")
         if _cleanup_in_progress_ws[0]:
             if now - _cleanup_started_at_ws[0] < 25:
                 print(f"\n{C_DIM}正在收尾與合併中，請稍候...{RESET}", flush=True)
@@ -5009,7 +5067,7 @@ def run_stream_moonshine(capture_id: int, translator, moonshine_model_name: str,
     def signal_handler(signum, frame):
         now = time.monotonic()
         _sigint_count_ms[0] += 1
-        print(f"\n{C_DIM}[DEBUG] 收到停止訊號 {signum}（第 {_sigint_count_ms[0]} 次）{RESET}", flush=True)
+        _debug_progress(f"收到停止訊號 {signum}（第 {_sigint_count_ms[0]} 次）")
         if _cleanup_in_progress_ms[0]:
             if now - _cleanup_started_at_ms[0] < 25:
                 print(f"\n{C_DIM}正在收尾與合併中，請稍候...{RESET}", flush=True)
@@ -5039,8 +5097,12 @@ def run_stream_moonshine(capture_id: int, translator, moonshine_model_name: str,
         "en": "說英文即可看到字幕",
     }
     print(f"{C_OK}{BOLD}開始監聽...{RESET} {C_WHITE}{listen_hints.get(mode, '')}{RESET}\n\n", flush=True)
-    _webui_send({"type": "progress", "stage": "", "detail": ""})
+    _webui_send({"type": "progress", "stage": "正在監聽", "detail": "等待音訊輸入..."})
     _webui_send({"type": "started", "mode": mode})
+    
+    # 進度更新追蹤
+    _last_progress_update = [time.monotonic()]
+    _last_sentence_count = [0]
 
     # 設定狀態列
     _tr_model = translator.model if isinstance(translator, OllamaTranslator) else ("NLLB" if isinstance(translator, NllbTranslator) else ("Argos" if isinstance(translator, ArgosTranslator) else ""))
@@ -5057,6 +5119,14 @@ def run_stream_moonshine(capture_id: int, translator, moonshine_model_name: str,
             if _status_bar_active:
                 with print_lock:
                     refresh_status_bar()
+            # 定期發送進度更新（每 2 秒）
+            now = time.monotonic()
+            if now - _last_progress_update[0] > 2:
+                _last_progress_update[0] = now
+                current_count = _status_bar_state.get("count", 0)
+                if current_count > _last_sentence_count[0]:
+                    _last_sentence_count[0] = current_count
+                    _webui_send({"type": "progress", "stage": "正在處理", "detail": f"已處理 {current_count} 句"})
     except KeyboardInterrupt:
         signal_handler(signal.SIGINT, None)
 
@@ -5524,7 +5594,7 @@ def run_stream_remote(capture_id: int, translator, model_name: str,
             return
         _cleaned_up[0] = True
         stop_event.set()
-        print(f"{C_DIM}[DEBUG] 進入 remote cleanup{RESET}", flush=True)
+        _debug_progress("進入 remote cleanup")
         if _rec_stream_mic:
             try:
                 _rec_stream_mic.stop()
@@ -5552,7 +5622,7 @@ def run_stream_remote(capture_id: int, translator, model_name: str,
         video_path = ""
         if video_recorder:
             try:
-                print(f"{C_DIM}[DEBUG] remote cleanup: 開始 finalize video{RESET}", flush=True)
+                _debug_progress("remote cleanup: 開始 finalize video")
                 video_path = video_recorder.finalize(final_audio_path)
                 print(f"\n  {C_OK}✓ 錄影已儲存: {video_path}{RESET}", flush=True)
             except Exception as e:
@@ -5588,7 +5658,7 @@ def run_stream_remote(capture_id: int, translator, model_name: str,
     def signal_handler(signum, frame):
         now = time.monotonic()
         _sigint_count_rm[0] += 1
-        print(f"\n{C_DIM}[DEBUG] 收到停止訊號 {signum}（第 {_sigint_count_rm[0]} 次）{RESET}", flush=True)
+        _debug_progress(f"收到停止訊號 {signum}（第 {_sigint_count_rm[0]} 次）")
         if _cleanup_in_progress_rm[0]:
             if now - _cleanup_started_at_rm[0] < 25:
                 print(f"\n{C_DIM}正在收尾與合併中，請稍候...{RESET}", flush=True)
@@ -5623,7 +5693,7 @@ def run_stream_remote(capture_id: int, translator, model_name: str,
         "ja": "說日文即可看到字幕",
     }
     print(f"{C_OK}{BOLD}開始監聽...{RESET} {C_WHITE}{listen_hints.get(mode, '')}{RESET}\n\n", flush=True)
-    _webui_send({"type": "progress", "stage": "", "detail": ""})
+    _webui_send({"type": "progress", "stage": "正在監聽", "detail": "等待音訊輸入..."})
     _webui_send({"type": "started", "mode": mode})
 
     session_started_at = time.monotonic()
@@ -5640,6 +5710,10 @@ def run_stream_remote(capture_id: int, translator, model_name: str,
     step_sec = step_ms / 1000.0
     length_samples = ring_size  # 填滿整個緩衝才開始
     next_upload_time = time.monotonic() + (length_ms / 1000.0)  # 首次需等緩衝填滿
+    
+    # 進度更新追蹤
+    _last_progress_update = [time.monotonic()]
+    _last_sentence_count = [0]
 
     try:
         while not stop_event.is_set():
@@ -5648,8 +5722,16 @@ def run_stream_remote(capture_id: int, translator, model_name: str,
             if _status_bar_active:
                 with print_lock:
                     refresh_status_bar()
-
+            
+            # 定期發送進度更新（每 2 秒）
             now = time.monotonic()
+            if now - _last_progress_update[0] > 2:
+                _last_progress_update[0] = now
+                current_count = _status_bar_state.get("count", 0)
+                if current_count > _last_sentence_count[0]:
+                    _last_sentence_count[0] = current_count
+                    _webui_send({"type": "progress", "stage": "正在處理", "detail": f"已處理 {current_count} 句"})
+
             if pause_event.is_set():
                 # 暫停中：音訊持續擷取但不上傳
                 next_upload_time = now + step_sec
@@ -6176,7 +6258,7 @@ def run_stream_local_whisper(capture_id: int, translator, model_name: str,
             return
         _cleaned_up[0] = True
         stop_event.set()
-        print(f"{C_DIM}[DEBUG] 進入 local cleanup{RESET}", flush=True)
+        _debug_progress("進入 local cleanup")
         if _rec_stream_mic:
             try:
                 _rec_stream_mic.stop()
@@ -6204,7 +6286,7 @@ def run_stream_local_whisper(capture_id: int, translator, model_name: str,
         video_path = ""
         if video_recorder:
             try:
-                print(f"{C_DIM}[DEBUG] local cleanup: 開始 finalize video{RESET}", flush=True)
+                _debug_progress("local cleanup: 開始 finalize video")
                 video_path = video_recorder.finalize(final_audio_path)
                 print(f"\n  {C_OK}錄影已儲存: {video_path}{RESET}", flush=True)
             except Exception as e:
@@ -6238,7 +6320,7 @@ def run_stream_local_whisper(capture_id: int, translator, model_name: str,
     def signal_handler(signum, frame):
         now = time.monotonic()
         _sigint_count_lc[0] += 1
-        print(f"\n{C_DIM}[DEBUG] 收到停止訊號 {signum}（第 {_sigint_count_lc[0]} 次）{RESET}", flush=True)
+        _debug_progress(f"收到停止訊號 {signum}（第 {_sigint_count_lc[0]} 次）")
         if _cleanup_in_progress_lc[0]:
             if now - _cleanup_started_at_lc[0] < 25:
                 print(f"\n{C_DIM}正在收尾與合併中，請稍候...{RESET}", flush=True)
@@ -6289,10 +6371,15 @@ def run_stream_local_whisper(capture_id: int, translator, model_name: str,
         "ja": "說日文即可看到字幕",
     }
     print(f"\n{C_OK}{BOLD}開始監聽...{RESET} {C_WHITE}{listen_hints.get(mode, '')}{RESET}\n\n", flush=True)
+    _webui_send({"type": "progress", "stage": "正在監聽", "detail": "等待音訊輸入..."})
     _webui_send({"type": "started", "mode": mode})
 
     session_started_at = time.monotonic()
     realtime_segments = []
+    
+    # 進度更新追蹤
+    _last_progress_update = [time.monotonic()]
+    _last_sentence_count = [0]
 
     _tr_model = translator.model if isinstance(translator, OllamaTranslator) else ("NLLB" if isinstance(translator, NllbTranslator) else ("Argos" if isinstance(translator, ArgosTranslator) else ""))
     _tr_loc = "伺服器" if isinstance(translator, OllamaTranslator) else ("本機" if isinstance(translator, (ArgosTranslator, NllbTranslator)) else "")
@@ -6311,7 +6398,16 @@ def run_stream_local_whisper(capture_id: int, translator, model_name: str,
             if _status_bar_active:
                 with print_lock:
                     refresh_status_bar()
+            
+            # 定期發送進度更新（每 2 秒）
             now = time.monotonic()
+            if now - _last_progress_update[0] > 2:
+                _last_progress_update[0] = now
+                current_count = _status_bar_state.get("count", 0)
+                if current_count > _last_sentence_count[0]:
+                    _last_sentence_count[0] = current_count
+                    _webui_send({"type": "progress", "stage": "正在處理", "detail": f"已處理 {current_count} 句"})
+            
             if pause_event.is_set():
                 next_transcribe_time = now + step_sec
                 continue
@@ -7366,7 +7462,7 @@ def run_stream_bidirectional(lb_device_id, mic_device_id,
             return
         _cleaned_up[0] = True
         stop_event.set()
-        print(f"{C_DIM}[DEBUG] 進入 bidi cleanup{RESET}", flush=True)
+        _debug_progress("進入 bidi cleanup")
         # 等待進行中的辨識完成，避免 MLX Metal mutex 崩潰
         _still_active = False
         for _w in range(20):  # 最多等 2 秒（os._exit 會強制結束，不需等太久）
@@ -7399,7 +7495,7 @@ def run_stream_bidirectional(lb_device_id, mic_device_id,
         video_path = ""
         if video_recorder:
             try:
-                print(f"{C_DIM}[DEBUG] bidi cleanup: 開始 finalize video{RESET}", flush=True)
+                _debug_progress("bidi cleanup: 開始 finalize video")
                 audio_path = recorder_lb.path if recorder_lb else None
                 video_path = video_recorder.finalize(audio_path)
                 print(f"  {C_OK}錄影已儲存: {video_path}{RESET}", flush=True)
@@ -7437,7 +7533,7 @@ def run_stream_bidirectional(lb_device_id, mic_device_id,
     def signal_handler(signum, frame):
         now = time.monotonic()
         _sigint_count[0] += 1
-        print(f"\n{C_DIM}[DEBUG] 收到停止訊號 {signum}（第 {_sigint_count[0]} 次）{RESET}", flush=True)
+        _debug_progress(f"收到停止訊號 {signum}（第 {_sigint_count[0]} 次）")
         if _cleanup_in_progress[0]:
             # 收尾期間忽略重複停止，避免中斷 finalize 導致 mkv 殘留。
             if now - _cleanup_started_at[0] < 25:
@@ -7489,11 +7585,15 @@ def run_stream_bidirectional(lb_device_id, mic_device_id,
     else:
         _listen_mic_hint = f"{_mic_color}▶ 麥克風（{_mic_dir}）{RESET}"
     print(f"\n{C_OK}{BOLD}開始監聽...{RESET} {C_OK}◀ 系統音訊（{_lb_dir}）{RESET}  {_listen_mic_hint}\n\n", flush=True)
-    _webui_send({"type": "progress", "stage": "", "detail": ""})
+    _webui_send({"type": "progress", "stage": "正在監聽", "detail": "等待音訊輸入..."})
     _webui_send({"type": "started", "mode": mode})
 
     session_started_at = time.monotonic()
     realtime_segments = []
+    
+    # 進度更新追蹤
+    _last_progress_update = [time.monotonic()]
+    _last_sentence_count = [0]
 
     _tr_model = translator_lb.model if isinstance(translator_lb, OllamaTranslator) else ("NLLB" if isinstance(translator_lb, NllbTranslator) else "")
     _tr_loc = "伺服器" if isinstance(translator_lb, OllamaTranslator) else ("本機" if isinstance(translator_lb, NllbTranslator) else "")
@@ -7515,7 +7615,17 @@ def run_stream_bidirectional(lb_device_id, mic_device_id,
             if _status_bar_active:
                 with print_lock:
                     refresh_status_bar()
+            
             now = time.monotonic()
+            
+            # 定期發送進度更新（每 2 秒）
+            if now - _last_progress_update[0] > 2:
+                _last_progress_update[0] = now
+                current_count = _status_bar_state.get("count", 0)
+                if current_count > _last_sentence_count[0]:
+                    _last_sentence_count[0] = current_count
+                    _webui_send({"type": "progress", "stage": "正在處理", "detail": f"已處理 {current_count} 句"})
+            
             if pause_event.is_set():
                 next_time_lb = now + step_sec
                 next_time_mic = now + step_sec
@@ -9411,6 +9521,22 @@ def _move_path_into_dir(path, session_dir):
     return dst_path
 
 
+def _copy_path_into_dir(path, session_dir):
+    """將檔案複製到 session 目錄（原始檔保留）；不存在時直接略過。"""
+    import shutil
+
+    if not path or not os.path.exists(path):
+        return ""
+    abs_path = os.path.abspath(path)
+    abs_session_dir = os.path.abspath(session_dir)
+    if os.path.dirname(abs_path) == abs_session_dir:
+        return abs_path
+
+    dst_path = _unique_destination_path(os.path.join(abs_session_dir, os.path.basename(abs_path)))
+    shutil.copy2(abs_path, dst_path)
+    return dst_path
+
+
 def _package_realtime_outputs(log_path, mode, segments_data=None, audio_paths=None,
                               video_path="", meeting_topic=None):
     """將即時模式輸出整理成離線模式相近的 session 資料夾。"""
@@ -9438,10 +9564,10 @@ def _package_realtime_outputs(log_path, mode, segments_data=None, audio_paths=No
     moved_log_path = _move_path_into_dir(log_path, session_dir)
     moved_audio_paths = []
     for audio_path in audio_paths or []:
-        moved_audio = _move_path_into_dir(audio_path, session_dir)
+        moved_audio = _copy_path_into_dir(audio_path, session_dir)
         if moved_audio:
             moved_audio_paths.append(moved_audio)
-    moved_video_path = _move_path_into_dir(video_path, session_dir) if video_path else ""
+    moved_video_path = _copy_path_into_dir(video_path, session_dir) if video_path else ""
     primary_media_path = moved_video_path or (moved_audio_paths[0] if moved_audio_paths else "")
 
     transcript_html_path = ""
@@ -9451,7 +9577,9 @@ def _package_realtime_outputs(log_path, mode, segments_data=None, audio_paths=No
         base_no_ext = os.path.splitext(moved_log_path)[0]
         srt_path = f"{base_no_ext}.srt"
         vtt_path = f"{base_no_ext}.vtt"
+        _webui_send({"type": "progress", "stage": "生成字幕", "detail": "正在生成 SRT..."})
         _segments_to_srt(segments_data, srt_path)
+        _webui_send({"type": "progress", "stage": "生成字幕", "detail": "正在生成 VTT..."})
         _segments_to_vtt(segments_data, vtt_path)
         if primary_media_path and os.path.exists(primary_media_path):
             media_info = _ffprobe_info(primary_media_path)
@@ -9462,6 +9590,7 @@ def _package_realtime_outputs(log_path, mode, segments_data=None, audio_paths=No
                 media_duration = float(segments_data[-1].get("end", 0.0) or 0.0)
             if media_duration > 0:
                 transcript_html_path = f"{base_no_ext}.html"
+                _webui_send({"type": "progress", "stage": "生成字幕", "detail": "正在生成 HTML..."})
                 _transcript_to_html(
                     segments_data,
                     transcript_html_path,
@@ -9515,7 +9644,7 @@ def _run_realtime_postprocess(log_path, summary_mode, model, host, port,
     _label = "逐字稿校正" if summary_mode == "correct_only" else "摘要 + 校正逐字稿"
     print(f"  {C_DIM}模式: {_label}{RESET}")
     print(f"  {C_DIM}模型: {model} @ {host}:{port}{RESET}")
-    _webui_send({"type": "progress", "stage": "轉錄後處理", "detail": f"開始 {_label}"})
+    _webui_send({"type": "progress", "stage": "轉錄後處理", "detail": f"初始化 {_label}..."})
 
     metadata = {
         "summary_model": model,
@@ -9523,6 +9652,7 @@ def _run_realtime_postprocess(log_path, summary_mode, model, host, port,
         "meeting_topic": topic,
     }
     try:
+        _webui_send({"type": "progress", "stage": "轉錄後處理", "detail": f"開始 {_label}..."})
         out_path, _, html_path = summarize_log_file(
             log_path, model, host, port,
             server_type=server_type,

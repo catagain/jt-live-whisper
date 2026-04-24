@@ -212,6 +212,19 @@ def _tcp_receiver():
                     if line and _event_queue:
                         try:
                             _event_queue.put_nowait(line)
+                        except asyncio.QueueFull:
+                            # 佇列滿時保留 progress / disconnected / output_files 等關鍵事件。
+                            try:
+                                ev = json.loads(line)
+                                is_transcription = ev.get("type") == "transcription"
+                            except Exception:
+                                is_transcription = False
+                            if not is_transcription:
+                                try:
+                                    _event_queue.get_nowait()
+                                    _event_queue.put_nowait(line)
+                                except Exception:
+                                    pass
                         except Exception:
                             pass
             except socket.timeout:
