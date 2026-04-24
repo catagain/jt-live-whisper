@@ -13923,28 +13923,13 @@ def main():
                 except Exception as e:
                     print(f"  {C_HIGHLIGHT}[錯誤] 摘要失敗: {e}{RESET}")
 
-        # 送出所有產出檔案給 WebUI
-        _output_files = []
-        for lp, orig_fpath, sess_dir in log_paths:
-            if sess_dir and os.path.isdir(sess_dir):
-                for fname in sorted(os.listdir(sess_dir)):
-                    fpath = os.path.join(sess_dir, fname)
-                    if os.path.isfile(fpath):
-                        # 排除原始音訊副本（太大不需要列出）
-                        ext = os.path.splitext(fname)[1].lower()
-                        if ext in (".wav", ".mp3", ".m4a", ".flac", ".ogg", ".wma", ".aac", ".opus"):
-                            continue
-                        rel = os.path.relpath(fpath, os.path.dirname(os.path.abspath(__file__)))
-                        _output_files.append({"name": fname, "path": rel})
-        # 收集 session 目錄（相對路徑）
+        # 送出所有產出檔案給 WebUI（共用 helper，避免重複邏輯）
         _session_dirs = []
         for _, _, sess_dir in log_paths:
             if sess_dir and os.path.isdir(sess_dir):
-                rel = os.path.relpath(sess_dir, os.path.dirname(os.path.abspath(__file__)))
-                if rel not in _session_dirs:
-                    _session_dirs.append(rel)
-        if _output_files or _session_dirs:
-            _webui_send({"type": "output_files", "files": _output_files, "dirs": _session_dirs})
+                if sess_dir not in _session_dirs:
+                    _session_dirs.append(sess_dir)
+        _webui_send_output_files(_session_dirs)
 
         # 所有處理完成後一起開啟 HTML + 子目錄
         for hp in html_to_open:
