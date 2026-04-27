@@ -10900,15 +10900,17 @@ def process_audio_file(input_path, mode, translator, model_size="large-v3-turbo"
     if probe and probe[0] > 0:
         audio_duration = probe[0]
 
-    # 在 ASR 期間背景預熱 LLM（避免 ASR 後模型已卸載導致翻譯超時）
+    # 背景預熱 LLM（遠端 ASR 時並行啟動以節省時間；本機 ASR 則等 Whisper 卸載後再啟動，避免記憶體爭用）
     _warmup_thread = None
     _warmup_ok = [False]
-    if need_translate and translator and hasattr(translator, "warmup"):
-        import threading
-        def _bg_warmup(tr=translator, result=_warmup_ok):
-            result[0] = tr.warmup()
-        _warmup_thread = threading.Thread(target=_bg_warmup, daemon=True)
-        _warmup_thread.start()
+    def _launch_warmup():
+        nonlocal _warmup_thread
+        if need_translate and translator and hasattr(translator, "warmup") and _warmup_thread is None:
+            import threading
+            def _bg_warmup(tr=translator, result=_warmup_ok):
+                result[0] = tr.warmup()
+            _warmup_thread = threading.Thread(target=_bg_warmup, daemon=True)
+            _warmup_thread.start()
 
     # 3. 辨識：GPU 伺服器 或本機
     t_stage = time.monotonic()
@@ -10941,6 +10943,7 @@ def process_audio_file(input_path, mode, translator, model_size="large-v3-turbo"
             sbar.set_task("GPU 伺服器 辨識中", reset_timer=False)
             sbar.set_progress("等待伺服器回應...")
 
+        _launch_warmup()  # 遠端 ASR 期間並行預熱 LLM
         try:
             r_segments, r_duration, r_proc_time, r_device = _remote_whisper_transcribe(
                 remote_whisper_cfg, wav_path, model_size, lang,
@@ -10968,7 +10971,8 @@ def process_audio_file(input_path, mode, translator, model_size="large-v3-turbo"
             return None, None, None
 
         print(f"  {C_WHITE}載入模型    {model_size}...{RESET}", end=" ", flush=True)
-        model = _call_with_ssl_retry(WhisperModel, model_size, device="auto", compute_type="float16")
+        model = _call_with_ssl_retry(WhisperModel, model_size, device="auto", compute_type="int8_float16",
+                                     cpu_threads=min(os.cpu_count() or 4, 4))
         print(f"{C_OK}✓{RESET}")
         print(f"  {C_WHITE}辨識中...{RESET}\n")
         _webui_send({"type": "progress", "stage": "辨識中", "detail": f"本機 {model_size}"})
@@ -10977,25 +10981,76 @@ def process_audio_file(input_path, mode, translator, model_size="large-v3-turbo"
         if audio_duration > 0:
             sbar.set_progress("0%")
 
-        segments_iter, info = model.transcribe(wav_path, language=lang, beam_size=5, vad_filter=True)
+        segments_iter, info = model.transcribe(wav_path, language=lang, beam_size=3, vad_filter=True)
+
+        def _collect_local_segments(iterable):
+            out = []
+            for segment in iterable:
+                if audio_duration > 0:
+                    pct = min(segment.end / audio_duration, 1.0)
+                    pos_m, pos_s = divmod(int(segment.end), 60)
+                    dur_m, dur_s = divmod(int(audio_duration), 60)
+                    sbar.set_progress(
+                        f"{pct:.0%}  {pos_m}:{pos_s:02d} / {dur_m}:{dur_s:02d}"
+                    )
+                text = segment.text.strip()
+                if text:
+                    out.append({
+                        "start": segment.start,
+                        "end": segment.end,
+                        "text": text,
+                    })
+            return out
 
         # 將 generator 轉為 list of dict（與伺服器格式統一）
-        raw_segments = []
-        for segment in segments_iter:
-            if audio_duration > 0:
-                pct = min(segment.end / audio_duration, 1.0)
-                pos_m, pos_s = divmod(int(segment.end), 60)
-                dur_m, dur_s = divmod(int(audio_duration), 60)
-                sbar.set_progress(
-                    f"{pct:.0%}  {pos_m}:{pos_s:02d} / {dur_m}:{dur_s:02d}"
-                )
-            text = segment.text.strip()
-            if text:
-                raw_segments.append({
-                    "start": segment.start,
-                    "end": segment.end,
-                    "text": text,
-                })
+        try:
+            raw_segments = _collect_local_segments(segments_iter)
+        except RuntimeError as e:
+            err = str(e)
+            if "CUBLAS_STATUS_NOT_SUPPORTED" in err or "cuBLAS failed" in err:
+                print(f"  {C_HIGHLIGHT}[降級] CUDA 目前量化不相容，嘗試其他 GPU 設定...{RESET}")
+                del model
+                import gc
+                gc.collect()
+                raw_segments = None
+                for _dev, _ctype in (("cuda", "float16"), ("cuda", "int8"), ("cpu", "int8")):
+                    try:
+                        model = _call_with_ssl_retry(
+                            WhisperModel,
+                            model_size,
+                            device=_dev,
+                            compute_type=_ctype,
+                            cpu_threads=min(os.cpu_count() or 4, 4),
+                        )
+                        segments_iter, info = model.transcribe(
+                            wav_path,
+                            language=lang,
+                            beam_size=3,
+                            vad_filter=True,
+                        )
+                        raw_segments = _collect_local_segments(segments_iter)
+                        if _dev == "cuda":
+                            print(f"  {C_OK}已改用 CUDA {_ctype} 繼續辨識{RESET}")
+                        else:
+                            print(f"  {C_HIGHLIGHT}[降級] 改用 CPU int8 辨識{RESET}")
+                        break
+                    except RuntimeError as e2:
+                        _err2 = str(e2)
+                        if "CUBLAS_STATUS_NOT_SUPPORTED" in _err2 or "cuBLAS failed" in _err2:
+                            try:
+                                del model
+                            except Exception:
+                                pass
+                            gc.collect()
+                            continue
+                        raise
+                if raw_segments is None:
+                    raise
+            else:
+                raise
+        del model  # 釋放 Whisper 模型記憶體，再啟動 LLM 避免記憶體爭用
+        import gc; gc.collect()  # 強制立即回收，確保記憶體還給 OS 後再啟動 LLM
+        _launch_warmup()  # 本機 ASR 完成後才預熱 LLM
 
     seg_count = 0
     try:
@@ -11410,7 +11465,8 @@ def process_bidi_audio_files(lb_path, mic_path, mode, translator_lb, translator_
                 return []
 
             print(f"  {C_WHITE}{label} 載入模型 {model_size}...{RESET}", end=" ", flush=True)
-            model = _call_with_ssl_retry(WhisperModel, model_size, device="auto", compute_type="float16")
+            model = _call_with_ssl_retry(WhisperModel, model_size, device="auto", compute_type="int8_float16",
+                                         cpu_threads=min(os.cpu_count() or 4, 4))
             print(f"{C_OK}✓{RESET}")
 
             sbar = _SummaryStatusBar(model=model_size, task=f"{label} 辨識中", asr_location="本機").start()
@@ -11420,15 +11476,61 @@ def process_bidi_audio_files(lb_path, mic_path, mode, translator_lb, translator_
             if _probe and _probe[0] > 0:
                 _dur = _probe[0]
 
-            segments_iter, info = model.transcribe(wav_path, language=lang, beam_size=5, vad_filter=True)
-            raw_segs = []
-            for segment in segments_iter:
-                if _dur > 0:
-                    pct = min(segment.end / _dur, 1.0)
-                    sbar.set_progress(f"{pct:.0%}")
-                text = segment.text.strip()
-                if text:
-                    raw_segs.append({"start": segment.start, "end": segment.end, "text": text})
+            segments_iter, info = model.transcribe(wav_path, language=lang, beam_size=3, vad_filter=True)
+
+            def _collect_local_raw(iterable):
+                out = []
+                for segment in iterable:
+                    if _dur > 0:
+                        pct = min(segment.end / _dur, 1.0)
+                        sbar.set_progress(f"{pct:.0%}")
+                    text = segment.text.strip()
+                    if text:
+                        out.append({"start": segment.start, "end": segment.end, "text": text})
+                return out
+
+            try:
+                raw_segs = _collect_local_raw(segments_iter)
+            except RuntimeError as e:
+                err = str(e)
+                if "CUBLAS_STATUS_NOT_SUPPORTED" in err or "cuBLAS failed" in err:
+                    print(f"  {C_HIGHLIGHT}[降級] {label} CUDA 目前量化不相容，嘗試其他 GPU 設定...{RESET}")
+                    del model
+                    import gc
+                    gc.collect()
+                    raw_segs = None
+                    for _dev, _ctype in (("cuda", "float16"), ("cuda", "int8"), ("cpu", "int8")):
+                        try:
+                            model = _call_with_ssl_retry(
+                                WhisperModel,
+                                model_size,
+                                device=_dev,
+                                compute_type=_ctype,
+                                cpu_threads=min(os.cpu_count() or 4, 4),
+                            )
+                            segments_iter, info = model.transcribe(wav_path, language=lang, beam_size=3, vad_filter=True)
+                            raw_segs = _collect_local_raw(segments_iter)
+                            if _dev == "cuda":
+                                print(f"  {C_OK}{label} 已改用 CUDA {_ctype} 繼續辨識{RESET}")
+                            else:
+                                print(f"  {C_HIGHLIGHT}[降級] {label} 改用 CPU int8 辨識{RESET}")
+                            break
+                        except RuntimeError as e2:
+                            _err2 = str(e2)
+                            if "CUBLAS_STATUS_NOT_SUPPORTED" in _err2 or "cuBLAS failed" in _err2:
+                                try:
+                                    del model
+                                except Exception:
+                                    pass
+                                gc.collect()
+                                continue
+                            raise
+                    if raw_segs is None:
+                        raise
+                else:
+                    raise
+            del model  # 釋放 Whisper 模型記憶體
+            import gc; gc.collect()  # 強制立即回收
             sbar.set_task(f"{label} 辨識完成（{len(raw_segs)} 段）", reset_timer=False)
             sbar.freeze()
             sbar.stop()
