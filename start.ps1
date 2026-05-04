@@ -98,7 +98,7 @@ $banner_line = '=' * $cols
 
 Write-Host ""
 Write-Host "${C_TITLE}${banner_line}${NC}"
-Write-Host "${C_TITLE}${BOLD}  jt-live-whisper v2.15.5 video recording version - 100% 全地端 AI 語音工具集${NC}"
+Write-Host "${C_TITLE}${BOLD}  jt-live-whisper v2.16.1 video recording version - 100% 全地端 AI 語音工具集${NC}"
 Write-Host "${C_TITLE}  Modified by 貓又 CatAgain${NC}"
 Write-Host "${C_TITLE}  fork from jt-live-whisper by Jason Cheng (Jason Tools)${NC}"
 Write-Host "${C_TITLE}${banner_line}${NC}"

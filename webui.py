@@ -52,11 +52,13 @@ try:
     from translate_meeting import (
         WHISPER_MODELS as _TM_WHISPER_MODELS,
         SUMMARY_MODELS as _TM_SUMMARY_MODELS,
+        APP_VERSION as _TM_APP_VERSION,
         _recommended_whisper_model as _tm_recommended_whisper_model,
     )
 except Exception:
     _TM_WHISPER_MODELS = None
     _TM_SUMMARY_MODELS = None
+    _TM_APP_VERSION = "2.16.1"
     _tm_recommended_whisper_model = None
 
 # ─── 安全設定 ──────────────────────────────────────────────────
@@ -157,7 +159,7 @@ async def lifespan(app):
     _stop_proc()
 
 
-app = FastAPI(title="jt-live-whisper WebUI", lifespan=lifespan)
+app = FastAPI(title="live-whisper 會議語音辨識系統", lifespan=lifespan)
 
 # ─── 靜態檔案服務（logs/ 子目錄，供 WebUI 開啟逐字稿/摘要 HTML）───
 _logs_dir = BASE_DIR / "logs"
@@ -529,7 +531,7 @@ def _get_config():
         "gpu_host": gpu_host, "summary_descs": summary_descs,
         "recommended_models": recommended_models,
         "default_engine": "llm" if llm_host else "nllb",
-        "last": last, "version": "2.16.1",
+        "last": last, "version": _TM_APP_VERSION,
         "has_read_pw": bool(_webui_passwords["read"]),
         "has_admin_pw": bool(_webui_passwords["admin"]),
     }
