@@ -54,12 +54,14 @@ try:
         SUMMARY_MODELS as _TM_SUMMARY_MODELS,
         APP_VERSION as _TM_APP_VERSION,
         _recommended_whisper_model as _tm_recommended_whisper_model,
+        _HDMIMultiviewOutput as _TM_HDMIMultiviewOutput,
     )
 except Exception:
     _TM_WHISPER_MODELS = None
     _TM_SUMMARY_MODELS = None
     _TM_APP_VERSION = "2.16.1"
     _tm_recommended_whisper_model = None
+    _TM_HDMIMultiviewOutput = None
 
 # ─── 安全設定 ──────────────────────────────────────────────────
 _webui_passwords = {"read": "", "admin": ""}  # 從 config.json 載入
@@ -106,6 +108,17 @@ _proc: subprocess.Popen = None
 _proc_lock = threading.Lock()
 _proc_log_path = None
 _proc_stopping = False
+_webui_hdmi_output = None
+
+
+def _stop_webui_hdmi_output():
+    global _webui_hdmi_output
+    if _webui_hdmi_output is not None:
+        try:
+            _webui_hdmi_output.stop()
+        except Exception:
+            pass
+        _webui_hdmi_output = None
 
 
 def _stream_proc_output(proc, log_path: Path):
@@ -157,6 +170,7 @@ async def lifespan(app):
     yield
     # shutdown: kill subprocess
     _stop_proc()
+    _stop_webui_hdmi_output()
 
 
 app = FastAPI(title="live-whisper 會議語音辨識系統", lifespan=lifespan)
@@ -948,6 +962,25 @@ def _build_args(body: dict) -> list:
     video_device = body.get("video_device", "").strip()
     if video_device:
         args.extend(["--video-device", video_device])
+
+    if body.get("hdmi_enable"):
+        args.append("--hdmi-output")
+        hdmi_layout = (body.get("hdmi_layout") or "grid").strip()
+        args.extend(["--hdmi-layout", hdmi_layout])
+        hdmi_display = body.get("hdmi_display")
+        if hdmi_display not in (None, ""):
+            args.extend(["--hdmi-display", str(int(hdmi_display))])
+        hdmi_resolution = (body.get("hdmi_resolution") or "1920x1080").strip()
+        if hdmi_resolution:
+            args.extend(["--hdmi-resolution", hdmi_resolution])
+        hdmi_fps = body.get("hdmi_fps")
+        if hdmi_fps not in (None, ""):
+            args.extend(["--hdmi-fps", str(int(hdmi_fps))])
+        for src in (body.get("hdmi_sources") or [])[:4]:
+            src = str(src).strip()
+            if src:
+                args.extend(["--hdmi-source", src])
+
     if body.get("mic"):
         args.append("--mic")
     if body.get("denoise"):
@@ -1015,6 +1048,12 @@ async def api_start(request: Request, body: dict = {}):
             "rec_audio_source": body.get("rec_audio_source", "system"),
             "record_video": body.get("record_video", False),
             "video_device": body.get("video_device", ""),
+            "hdmi_enable": body.get("hdmi_enable", False),
+            "hdmi_layout": body.get("hdmi_layout", "grid"),
+            "hdmi_display": body.get("hdmi_display", 0),
+            "hdmi_resolution": body.get("hdmi_resolution", "1920x1080"),
+            "hdmi_fps": body.get("hdmi_fps", 30),
+            "hdmi_sources": body.get("hdmi_sources", []),
             "denoise": body.get("denoise", True),
             "diarize": body.get("diarize", False),
             "num_speakers": body.get("num_speakers", 0),
@@ -1148,10 +1187,40 @@ async def websocket_endpoint(ws: WebSocket):
 
 # ─── 主程式 ──────────────────────────────────────────────────
 def main():
+    global _webui_hdmi_output
     parser = argparse.ArgumentParser(description="jt-live-whisper WebUI")
     parser.add_argument("--port", type=int, default=WEB_PORT, help=f"HTTP port (預設 {WEB_PORT})")
     parser.add_argument("--no-browser", action="store_true", help="不自動開啟瀏覽器")
-    args = parser.parse_args()
+    parser.add_argument("--hdmi-output", action="store_true", help="啟用 HDMI 分割輸出（WebUI 啟動時即開啟）")
+    parser.add_argument("--hdmi-layout", default="grid", help="HDMI 版型：grid/focus_left/focus_top")
+    parser.add_argument("--hdmi-display", type=int, default=0, help="HDMI 顯示器編號（預設 0）")
+    parser.add_argument("--hdmi-resolution", default="1920x1080", help="HDMI 解析度（預設 1920x1080）")
+    parser.add_argument("--hdmi-fps", type=int, default=30, help="HDMI 輸出 FPS（預設 30）")
+    parser.add_argument("--hdmi-source", action="append", default=[], help="HDMI 來源（可重複，最多 4 路）")
+    args, _unknown = parser.parse_known_args()
+
+    # HDMI 分割輸出：WebUI 進入設定流程前即開啟，並在整個程序期間常駐
+    if args.hdmi_output:
+        if _TM_HDMIMultiviewOutput is None:
+            print("  [警告] 無法載入 HDMI 輸出模組，已略過")
+        else:
+            try:
+                _webui_hdmi_output = _TM_HDMIMultiviewOutput(
+                    layout=args.hdmi_layout,
+                    display=args.hdmi_display,
+                    resolution=args.hdmi_resolution,
+                    fps=args.hdmi_fps,
+                    sources=(args.hdmi_source or []),
+                )
+                _webui_hdmi_output.start()
+                print(
+                    "  [WebUI] HDMI 分割輸出已啟動: "
+                    f"版型={_webui_hdmi_output.layout}, 顯示器={_webui_hdmi_output.display}, "
+                    f"解析度={_webui_hdmi_output.width}x{_webui_hdmi_output.height}, 來源={len(_webui_hdmi_output.sources)}"
+                )
+            except Exception as e:
+                print(f"  [警告] 啟動 HDMI 分割輸出失敗: {e}")
+                _webui_hdmi_output = None
 
     # 檢查 port 是否被佔用
     import socket as _check_sock
@@ -1167,6 +1236,7 @@ def main():
             try:
                 _choice = input("  選擇 (1/2) [1]：").strip()
             except (EOFError, KeyboardInterrupt):
+                _stop_webui_hdmi_output()
                 sys.exit(0)
             if _choice == "2":
                 if _port == args.port:
@@ -1183,6 +1253,20 @@ def main():
                 import subprocess as _sp
                 if sys.platform == "darwin" or sys.platform == "linux":
                     _pids = _sp.check_output(["lsof", "-ti", f":{_port}"], text=True).strip().split()
+                elif sys.platform == "win32":
+                    _raw = _sp.check_output(["netstat", "-ano"], text=True, stderr=_sp.DEVNULL)
+                    _pids = []
+                    _needle = f":{_port}"
+                    for _line in _raw.splitlines():
+                        _parts = _line.split()
+                        if len(_parts) < 5:
+                            continue
+                        _local = _parts[1]
+                        _state = _parts[3] if len(_parts) > 4 else ""
+                        _pid = _parts[-1]
+                        if _needle in _local and _state.upper() == "LISTENING" and _pid.isdigit():
+                            _pids.append(_pid)
+                    _pids = list(dict.fromkeys(_pids))
                 else:
                     _pids = _sp.check_output(["fuser", f"{_port}/tcp"], text=True, stderr=_sp.DEVNULL).strip().split()
                 for _pid in _pids:
@@ -1194,6 +1278,7 @@ def main():
                 print(f"  [完成] Port {_port} 已清理")
             except Exception:
                 print(f"  [錯誤] 無法清理 Port {_port}，請手動結束佔用的程序")
+                _stop_webui_hdmi_output()
                 sys.exit(1)
         else:
             _s.close()
@@ -1209,6 +1294,7 @@ def main():
     def _sigint_handler(sig, frame):
         print("\n  正在停止...")
         _stop_proc()
+        _stop_webui_hdmi_output()
         print("  WebUI 已停止")
         os._exit(0)
     signal.signal(signal.SIGINT, _sigint_handler)
@@ -1219,6 +1305,7 @@ def main():
         pass
     finally:
         _stop_proc()
+        _stop_webui_hdmi_output()
         print("\n  WebUI 已停止")
         os._exit(0)
 

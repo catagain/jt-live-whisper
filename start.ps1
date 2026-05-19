@@ -209,7 +209,13 @@ if (-not (Test-Path $MAIN_PY)) {
 # --webui 模式：啟動 WebUI 伺服器（設定與字幕都在瀏覽器操作）
 $WEBUI_PY = Join-Path $SCRIPT_DIR "webui.py"
 if ($args -contains "--webui") {
-    & $VENV_PYTHON $WEBUI_PY
+    $webuiArgs = @()
+    foreach ($a in $args) {
+        if ($a -ne "--webui") {
+            $webuiArgs += $a
+        }
+    }
+    & $VENV_PYTHON $WEBUI_PY @webuiArgs
 } else {
     & $VENV_PYTHON $MAIN_PY @args
 }
