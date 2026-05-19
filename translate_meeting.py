@@ -4185,7 +4185,7 @@ def run_stream(capture_id: int, translator, model_name: str, model_path: str,
     if hdmi_output_config and hdmi_output_config.get("enabled") and not hdmi_managed_in_main:
         try:
             hdmi_output = _HDMIMultiviewOutput(
-                layout=hdmi_output_config.get("layout", "grid"),
+                layout=hdmi_output_config.get("layout", "auto"),
                 display=hdmi_output_config.get("display", 0),
                 resolution=hdmi_output_config.get("resolution", "1920x1080"),
                 fps=hdmi_output_config.get("fps", 30),
@@ -5367,7 +5367,7 @@ def run_stream_remote(capture_id: int, translator, model_name: str,
     if hdmi_output_config and hdmi_output_config.get("enabled") and not hdmi_managed_in_main:
         try:
             hdmi_output = _HDMIMultiviewOutput(
-                layout=hdmi_output_config.get("layout", "grid"),
+                layout=hdmi_output_config.get("layout", "auto"),
                 display=hdmi_output_config.get("display", 0),
                 resolution=hdmi_output_config.get("resolution", "1920x1080"),
                 fps=hdmi_output_config.get("fps", 30),
@@ -6069,7 +6069,7 @@ def run_stream_local_whisper(capture_id: int, translator, model_name: str,
     if hdmi_output_config and hdmi_output_config.get("enabled") and not hdmi_managed_in_main:
         try:
             hdmi_output = _HDMIMultiviewOutput(
-                layout=hdmi_output_config.get("layout", "grid"),
+                layout=hdmi_output_config.get("layout", "auto"),
                 display=hdmi_output_config.get("display", 0),
                 resolution=hdmi_output_config.get("resolution", "1920x1080"),
                 fps=hdmi_output_config.get("fps", 30),
@@ -6954,7 +6954,7 @@ def run_stream_bidirectional(lb_device_id, mic_device_id,
     if hdmi_output_config and hdmi_output_config.get("enabled") and not hdmi_managed_in_main:
         try:
             hdmi_output = _HDMIMultiviewOutput(
-                layout=hdmi_output_config.get("layout", "grid"),
+                layout=hdmi_output_config.get("layout", "auto"),
                 display=hdmi_output_config.get("display", 0),
                 resolution=hdmi_output_config.get("resolution", "1920x1080"),
                 fps=hdmi_output_config.get("fps", 30),
@@ -8587,7 +8587,7 @@ class _HDMIMultiviewOutput:
     透過 ffmpeg 合成分割畫面，再用 ffplay 全螢幕顯示，供 HDMI 外接顯示器輸出。
     """
 
-    def __init__(self, layout="grid", display=0, resolution="1920x1080", fps=30, sources=None):
+    def __init__(self, layout="auto", display=0, resolution="1920x1080", fps=30, sources=None):
         import shutil as _shutil
 
         self._ffmpeg = _shutil.which("ffmpeg")
@@ -8597,18 +8597,30 @@ class _HDMIMultiviewOutput:
         if not self._ffplay:
             raise RuntimeError("找不到 ffplay，無法啟用 HDMI 分割輸出")
 
-        self.layout = layout or "grid"
+        self.layout = layout or "auto"
         self.display = int(display or 0)
         self.fps = int(fps or 30)
-        self.sources = [s.strip() for s in (sources or []) if str(s).strip()]
+        self.sources = [str(s).strip() for s in (sources or [])][:4]
+        while self.sources and not self.sources[-1]:
+            self.sources.pop()
         if not self.sources:
             self.sources = ["desktop"]
-        self.sources = self.sources[:4]
 
         self.width, self.height = self._parse_resolution(resolution)
-        self._udp_url = "udp://127.0.0.1:23001?pkt_size=1316"
+        self._udp_port = self._pick_udp_port()
+        self._udp_url = f"udp://127.0.0.1:{self._udp_port}?pkt_size=1316"
         self._ffmpeg_proc = None
         self._ffplay_proc = None
+
+    def _pick_udp_port(self):
+        """每個 HDMI 實例使用獨立 UDP port，避免殘留 sender 混流造成閃爍。"""
+        import socket as _socket
+        s = _socket.socket(_socket.AF_INET, _socket.SOCK_DGRAM)
+        try:
+            s.bind(("127.0.0.1", 0))
+            return int(s.getsockname()[1])
+        finally:
+            s.close()
 
     def _parse_resolution(self, text):
         m = re.match(r"^\s*(\d+)x(\d+)\s*$", str(text or ""), flags=re.IGNORECASE)
@@ -8647,7 +8659,7 @@ class _HDMIMultiviewOutput:
     def _parse_source(self, spec):
         s = (spec or "").strip()
         if not s:
-            return {"kind": "desktop"}
+            return {"kind": "black"}
         low = s.lower()
 
         if low == "desktop":
@@ -8683,6 +8695,8 @@ class _HDMIMultiviewOutput:
                     raise RuntimeError("找不到可用攝影機，請指定 --hdmi-source camera:裝置名稱")
                 return ["-f", "dshow", "-i", f"video={name}"]
             return ["-f", "avfoundation", "-framerate", str(self.fps), "-i", "0:none"]
+        if kind == "black":
+            return ["-f", "lavfi", "-i", f"color=size={self.width}x{self.height}:rate={self.fps}:color=black"]
         if kind == "testsrc":
             return [
                 "-f", "lavfi",
@@ -8697,34 +8711,38 @@ class _HDMIMultiviewOutput:
     def _compute_slots(self, count):
         count = max(1, min(4, int(count)))
         w, h = self.width, self.height
-        if count == 1:
+        layout = (self.layout or "auto").lower()
+
+        if count == 1 or layout in ("full", "fullscreen"):
             return [(0, 0, w, h)]
 
-        if self.layout == "focus_left":
-            main_w = int(w * 0.66)
-            slots = [(0, 0, main_w, h)]
-            right_w = w - main_w
-            rem = count - 1
-            cell_h = h // rem
-            for i in range(rem):
-                y = i * cell_h
-                hh = cell_h if i < rem - 1 else (h - y)
-                slots.append((main_w, y, right_w, hh))
-            return slots
+        if layout == "split2":
+            left_w = w // 2
+            return [
+                (0, 0, left_w, h),
+                (left_w, 0, w - left_w, h),
+            ][:count]
 
-        if self.layout == "focus_top":
-            main_h = int(h * 0.66)
-            slots = [(0, 0, w, main_h)]
-            bottom_h = h - main_h
-            rem = count - 1
-            cell_w = w // rem
-            for i in range(rem):
-                x = i * cell_w
-                ww = cell_w if i < rem - 1 else (w - x)
-                slots.append((x, main_h, ww, bottom_h))
-            return slots
+        if layout in ("pip_tl", "pip_tr", "pip_bl", "pip_br"):
+            small_w = max(160, int(w * 0.28))
+            small_h = max(90, int(h * 0.28))
+            margin = max(12, int(min(w, h) * 0.03))
 
-        # 預設 grid（2x2）
+            if layout == "pip_tl":
+                x, y = margin, margin
+            elif layout == "pip_tr":
+                x, y = w - small_w - margin, margin
+            elif layout == "pip_bl":
+                x, y = margin, h - small_h - margin
+            else:  # pip_br
+                x, y = w - small_w - margin, h - small_h - margin
+
+            return [
+                (0, 0, w, h),
+                (x, y, small_w, small_h),
+            ][:count]
+
+        # quad / auto（3-4 路）
         cell_w = w // 2
         cell_h = h // 2
         base = [
@@ -8733,10 +8751,48 @@ class _HDMIMultiviewOutput:
             (0, cell_h, cell_w, h - cell_h),
             (cell_w, cell_h, w - cell_w, h - cell_h),
         ]
+        if layout == "auto" and count == 2:
+            left_w = w // 2
+            return [
+                (0, 0, left_w, h),
+                (left_w, 0, w - left_w, h),
+            ]
         return base[:count]
+
+    def _layout_input_limit(self, count):
+        """依版型限制可用來源數，避免版型與來源數不匹配。"""
+        layout = (self.layout or "auto").lower()
+        count = max(1, min(4, int(count)))
+        if layout in ("full", "fullscreen"):
+            return 1
+        if layout in ("split2", "pip_tl", "pip_tr", "pip_bl", "pip_br"):
+            return min(2, count)
+        return count
+
+    def _layout_natural_count(self):
+        """明確版型的固定 slot 數；auto 回傳 0（自適應）。"""
+        layout = (self.layout or "auto").lower()
+        if layout in ("full", "fullscreen"):
+            return 1
+        if layout in ("split2", "pip_tl", "pip_tr", "pip_bl", "pip_br"):
+            return 2
+        if layout == "quad":
+            return 4
+        return 0  # auto：依來源數自適應
 
     def _build_ffmpeg_command(self):
         parsed_sources = [self._parse_source(s) for s in self.sources]
+        natural = self._layout_natural_count()
+        if natural > 0:
+            # 明確版型：固定使用所有 slot，不足補黑畫面
+            parsed_sources = parsed_sources[:natural]
+            while len(parsed_sources) < natural:
+                parsed_sources.append({"kind": "black"})
+        else:
+            # auto：依來源數自適應
+            parsed_sources = parsed_sources[:self._layout_input_limit(len(parsed_sources))]
+            if not parsed_sources:
+                parsed_sources = [{"kind": "black"}]
         count = len(parsed_sources)
         slots = self._compute_slots(count)
 
@@ -8745,22 +8801,31 @@ class _HDMIMultiviewOutput:
             cmd.extend(self._source_input_args(src))
 
         filters = []
-        layout_parts = []
-        for i, (_, _, sw, sh) in enumerate(slots):
-            sw = max(16, int(sw))
-            sh = max(16, int(sh))
+        if count == 1:
+            sw = max(16, int(self.width))
+            sh = max(16, int(self.height))
             filters.append(
-                f"[{i}:v]fps={self.fps},"
+                f"[0:v]fps={self.fps},"
                 f"scale={sw}:{sh}:force_original_aspect_ratio=decrease,"
-                f"pad={sw}:{sh}:(ow-iw)/2:(oh-ih)/2,setsar=1[v{i}]"
+                f"pad={sw}:{sh}:(ow-iw)/2:(oh-ih)/2,setsar=1[outv]"
             )
-            x, y = slots[i][0], slots[i][1]
-            layout_parts.append(f"{int(x)}_{int(y)}")
+        else:
+            layout_parts = []
+            for i, (_, _, sw, sh) in enumerate(slots):
+                sw = max(16, int(sw))
+                sh = max(16, int(sh))
+                filters.append(
+                    f"[{i}:v]fps={self.fps},"
+                    f"scale={sw}:{sh}:force_original_aspect_ratio=decrease,"
+                    f"pad={sw}:{sh}:(ow-iw)/2:(oh-ih)/2,setsar=1[v{i}]"
+                )
+                x, y = slots[i][0], slots[i][1]
+                layout_parts.append(f"{int(x)}_{int(y)}")
 
-        in_refs = "".join([f"[v{i}]" for i in range(count)])
-        filters.append(
-            f"{in_refs}xstack=inputs={count}:layout={'|'.join(layout_parts)}:fill=black[outv]"
-        )
+            in_refs = "".join([f"[v{i}]" for i in range(count)])
+            filters.append(
+                f"{in_refs}xstack=inputs={count}:layout={'|'.join(layout_parts)}:fill=black[outv]"
+            )
         filter_complex = ";".join(filters)
 
         cmd.extend([
@@ -8792,30 +8857,102 @@ class _HDMIMultiviewOutput:
             self._udp_url,
         ]
 
-    def start(self):
-        if self._ffmpeg_proc and self._ffmpeg_proc.poll() is None:
-            return
+    def _start_ffplay(self):
         ffplay_env = os.environ.copy()
         ffplay_env["SDL_VIDEO_FULLSCREEN_DISPLAY"] = str(max(0, self.display))
-
         ffplay_cmd = self._build_ffplay_command()
         self._ffplay_proc = subprocess.Popen(
             ffplay_cmd,
             stdin=subprocess.PIPE,
             stdout=subprocess.DEVNULL,
-            stderr=subprocess.DEVNULL,
+            stderr=subprocess.PIPE,
             env=ffplay_env,
             **_SUBPROCESS_FLAGS,
         )
-        time.sleep(0.2)
+
+    def _start_ffmpeg_sender(self):
         ffmpeg_cmd = self._build_ffmpeg_command()
         self._ffmpeg_proc = subprocess.Popen(
             ffmpeg_cmd,
             stdin=subprocess.PIPE,
             stdout=subprocess.DEVNULL,
-            stderr=subprocess.DEVNULL,
+            stderr=subprocess.PIPE,
             **_SUBPROCESS_FLAGS,
         )
+
+    def _proc_exit_error(self, proc):
+        if proc is None or proc.poll() is None:
+            return ""
+        msg = ""
+        try:
+            err = b""
+            if proc.stderr:
+                err = proc.stderr.read() or b""
+            if isinstance(err, bytes):
+                msg = err.decode("utf-8", errors="replace").strip()
+            else:
+                msg = str(err).strip()
+        except Exception:
+            msg = ""
+        return msg
+
+    def _stop_ffmpeg_sender(self):
+        self._stop_proc(self._ffmpeg_proc, timeout=5)
+        self._ffmpeg_proc = None
+
+    def start(self):
+        if self._ffplay_proc and self._ffplay_proc.poll() is not None:
+            self._ffplay_proc = None
+        if self._ffmpeg_proc and self._ffmpeg_proc.poll() is not None:
+            self._ffmpeg_proc = None
+
+        if self._ffplay_proc is None:
+            self._start_ffplay()
+            time.sleep(0.35)
+            if self._ffplay_proc is None or self._ffplay_proc.poll() is not None:
+                detail = self._proc_exit_error(self._ffplay_proc)
+                raise RuntimeError(f"ffplay 啟動失敗（display={self.display}）。{detail}" if detail else f"ffplay 啟動失敗（display={self.display}）")
+
+        if self._ffmpeg_proc and self._ffmpeg_proc.poll() is None:
+            return
+        self._start_ffmpeg_sender()
+        time.sleep(0.25)
+        if self._ffmpeg_proc is None or self._ffmpeg_proc.poll() is not None:
+            detail = self._proc_exit_error(self._ffmpeg_proc)
+            raise RuntimeError(f"ffmpeg 啟動失敗（layout={self.layout}, sources={len(self.sources)}）。{detail}" if detail else f"ffmpeg 啟動失敗（layout={self.layout}, sources={len(self.sources)}）")
+
+    def reconfigure(self, layout=None, display=None, resolution=None, fps=None, sources=None):
+        """重新套用 HDMI 參數。
+
+        同一顯示器下僅重啟 ffmpeg sender，保留 ffplay 視窗避免切版型時視窗被關閉。
+        若顯示器改變才重啟 ffplay。
+        """
+        old_display = self.display
+        self.layout = (layout or self.layout or "auto")
+        self.display = int(self.display if display is None else display)
+        self.fps = int(self.fps if fps is None else fps)
+        self.width, self.height = self._parse_resolution(
+            resolution if resolution is not None else f"{self.width}x{self.height}"
+        )
+        if sources is not None:
+            self.sources = [str(s).strip() for s in (sources or [])][:4]
+            while self.sources and not self.sources[-1]:
+                self.sources.pop()
+            if not self.sources:
+                self.sources = ["desktop"]
+
+        if self.display != old_display:
+            self.stop()
+            self.start()
+            return
+
+        if self._ffplay_proc is None or self._ffplay_proc.poll() is not None:
+            self._ffplay_proc = None
+            self._start_ffplay()
+            time.sleep(0.15)
+
+        self._stop_ffmpeg_sender()
+        self._start_ffmpeg_sender()
 
     def _stop_proc(self, proc, timeout=5):
         if proc is None:
@@ -8850,9 +8987,8 @@ class _HDMIMultiviewOutput:
                 pass
 
     def stop(self):
-        self._stop_proc(self._ffmpeg_proc, timeout=5)
+        self._stop_ffmpeg_sender()
         self._stop_proc(self._ffplay_proc, timeout=3)
-        self._ffmpeg_proc = None
         self._ffplay_proc = None
 
 
@@ -13992,9 +14128,9 @@ def parse_args():
         "--hdmi-output", action="store_true",
         help="啟用即時 HDMI 分割畫面輸出（最多 4 路）")
     parser.add_argument(
-        "--hdmi-layout", choices=["grid", "focus_left", "focus_top"],
-        default="grid", metavar="LAYOUT",
-        help="HDMI 分割版型 (grid / focus_left / focus_top，預設 grid)")
+        "--hdmi-layout", choices=["auto", "split2", "quad", "pip_tl", "pip_tr", "pip_bl", "pip_br", "full", "fullscreen"],
+        default="auto", metavar="LAYOUT",
+        help="HDMI 分割版型 (auto / split2 / quad / pip_tl / pip_tr / pip_bl / pip_br / full)")
     parser.add_argument(
         "--hdmi-display", type=int, default=0, metavar="ID",
         help="HDMI 輸出顯示器編號（SDL display index，預設 0）")
@@ -14217,7 +14353,7 @@ def _build_cli_command(**kwargs):
     hdmi_output = kwargs.get("hdmi_output")
     if hdmi_output:
         parts.append("--hdmi-output")
-        hdmi_layout = kwargs.get("hdmi_layout") or "grid"
+        hdmi_layout = kwargs.get("hdmi_layout") or "auto"
         parts.append(f"--hdmi-layout {hdmi_layout}")
         hdmi_display = kwargs.get("hdmi_display")
         if hdmi_display is not None:
@@ -14262,7 +14398,7 @@ def _build_hdmi_output_config(args):
             _src.append(s)
     return {
         "enabled": True,
-        "layout": getattr(args, "hdmi_layout", "grid") or "grid",
+        "layout": getattr(args, "hdmi_layout", "auto") or "auto",
         "display": int(getattr(args, "hdmi_display", 0) or 0),
         "resolution": getattr(args, "hdmi_resolution", "1920x1080") or "1920x1080",
         "fps": int(getattr(args, "hdmi_fps", 30) or 30),
@@ -14335,7 +14471,7 @@ def main():
     if hdmi_output_cfg.get("enabled"):
         try:
             _hdmi_output_ref = _HDMIMultiviewOutput(
-                layout=hdmi_output_cfg.get("layout", "grid"),
+                layout=hdmi_output_cfg.get("layout", "auto"),
                 display=hdmi_output_cfg.get("display", 0),
                 resolution=hdmi_output_cfg.get("resolution", "1920x1080"),
                 fps=hdmi_output_cfg.get("fps", 30),

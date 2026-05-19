@@ -109,16 +109,98 @@ _proc_lock = threading.Lock()
 _proc_log_path = None
 _proc_stopping = False
 _webui_hdmi_output = None
+_webui_hdmi_cfg = None
+_webui_hdmi_lock = threading.Lock()
 
 
 def _stop_webui_hdmi_output():
-    global _webui_hdmi_output
+    global _webui_hdmi_output, _webui_hdmi_cfg
     if _webui_hdmi_output is not None:
         try:
             _webui_hdmi_output.stop()
         except Exception:
             pass
         _webui_hdmi_output = None
+    _webui_hdmi_cfg = None
+
+
+def _normalize_hdmi_cfg(data: dict | None) -> dict:
+    data = data or {}
+    _valid_layouts = {"auto", "split2", "quad", "pip_tl", "pip_tr", "pip_bl", "pip_br", "full", "fullscreen"}
+    raw_srcs = [str(s).strip() for s in (data.get("hdmi_sources") or [])]
+    # 保留中間的空位（位置式排版），去除尾端空字串
+    while raw_srcs and not raw_srcs[-1]:
+        raw_srcs.pop()
+    srcs = raw_srcs
+    layout = (data.get("hdmi_layout") or "auto").strip() or "auto"
+    if layout not in _valid_layouts:
+        layout = "auto"
+    return {
+        "enabled": bool(data.get("hdmi_enable", False)),
+        "layout": layout,
+        "display": int(data.get("hdmi_display", 0) or 0),
+        "resolution": (data.get("hdmi_resolution") or "1920x1080").strip() or "1920x1080",
+        "fps": int(data.get("hdmi_fps", 30) or 30),
+        "sources": srcs[:4],
+    }
+
+
+def _apply_webui_hdmi_config(data: dict | None) -> dict:
+    """由 WebUI 單一管理 HDMI 輸出，優先無縫套用（不關閉視窗）。"""
+    global _webui_hdmi_output, _webui_hdmi_cfg
+    cfg = _normalize_hdmi_cfg(data)
+    with _webui_hdmi_lock:
+        if not cfg["enabled"]:
+            if _webui_hdmi_output is not None:
+                _stop_webui_hdmi_output()
+                print("[WebUI] HDMI 分割輸出已停止", flush=True)
+            _webui_hdmi_cfg = cfg
+            return cfg
+
+        if _webui_hdmi_output is not None and _webui_hdmi_cfg == cfg:
+            return cfg
+
+        # 已在輸出中：優先無縫重設（同顯示器不重啟 ffplay 視窗）
+        if _webui_hdmi_output is not None:
+            try:
+                _webui_hdmi_output.reconfigure(
+                    layout=cfg["layout"],
+                    display=cfg["display"],
+                    resolution=cfg["resolution"],
+                    fps=cfg["fps"],
+                    sources=cfg["sources"],
+                )
+                _webui_hdmi_cfg = cfg
+                print(
+                    "[WebUI] HDMI 分割輸出已套用: "
+                    f"版型={_webui_hdmi_output.layout}, 顯示器={_webui_hdmi_output.display}, "
+                    f"解析度={_webui_hdmi_output.width}x{_webui_hdmi_output.height}, 來源={len(_webui_hdmi_output.sources)}",
+                    flush=True,
+                )
+                return cfg
+            except Exception as e:
+                print(f"[WebUI] HDMI 無縫套用失敗，改走重建流程: {e}", flush=True)
+                _stop_webui_hdmi_output()
+
+        if _TM_HDMIMultiviewOutput is None:
+            raise RuntimeError("無法載入 HDMI 輸出模組")
+
+        _webui_hdmi_output = _TM_HDMIMultiviewOutput(
+            layout=cfg["layout"],
+            display=cfg["display"],
+            resolution=cfg["resolution"],
+            fps=cfg["fps"],
+            sources=cfg["sources"],
+        )
+        _webui_hdmi_output.start()
+        _webui_hdmi_cfg = cfg
+        print(
+            "[WebUI] HDMI 分割輸出已套用: "
+            f"版型={_webui_hdmi_output.layout}, 顯示器={_webui_hdmi_output.display}, "
+            f"解析度={_webui_hdmi_output.width}x{_webui_hdmi_output.height}, 來源={len(_webui_hdmi_output.sources)}",
+            flush=True,
+        )
+        return cfg
 
 
 def _stream_proc_output(proc, log_path: Path):
@@ -963,23 +1045,7 @@ def _build_args(body: dict) -> list:
     if video_device:
         args.extend(["--video-device", video_device])
 
-    if body.get("hdmi_enable"):
-        args.append("--hdmi-output")
-        hdmi_layout = (body.get("hdmi_layout") or "grid").strip()
-        args.extend(["--hdmi-layout", hdmi_layout])
-        hdmi_display = body.get("hdmi_display")
-        if hdmi_display not in (None, ""):
-            args.extend(["--hdmi-display", str(int(hdmi_display))])
-        hdmi_resolution = (body.get("hdmi_resolution") or "1920x1080").strip()
-        if hdmi_resolution:
-            args.extend(["--hdmi-resolution", hdmi_resolution])
-        hdmi_fps = body.get("hdmi_fps")
-        if hdmi_fps not in (None, ""):
-            args.extend(["--hdmi-fps", str(int(hdmi_fps))])
-        for src in (body.get("hdmi_sources") or [])[:4]:
-            src = str(src).strip()
-            if src:
-                args.extend(["--hdmi-source", src])
+    # HDMI 由 WebUI 常駐管理，不傳遞至子程序，避免重複輸出互搶。
 
     if body.get("mic"):
         args.append("--mic")
@@ -1034,6 +1100,10 @@ async def api_start(request: Request, body: dict = {}):
     err = _check_auth(request, "admin")
     if err:
         return JSONResponse({"status": "error", "error": err}, status_code=403)
+    try:
+        _apply_webui_hdmi_config(body)
+    except Exception as e:
+        return JSONResponse({"status": "error", "error": f"HDMI 套用失敗: {e}"}, status_code=400)
     args = _build_args(body)
     pid = _start_proc(args)
     # 儲存前次使用的設定到 config.json
@@ -1049,7 +1119,7 @@ async def api_start(request: Request, body: dict = {}):
             "record_video": body.get("record_video", False),
             "video_device": body.get("video_device", ""),
             "hdmi_enable": body.get("hdmi_enable", False),
-            "hdmi_layout": body.get("hdmi_layout", "grid"),
+            "hdmi_layout": body.get("hdmi_layout", "auto"),
             "hdmi_display": body.get("hdmi_display", 0),
             "hdmi_resolution": body.get("hdmi_resolution", "1920x1080"),
             "hdmi_fps": body.get("hdmi_fps", 30),
@@ -1082,6 +1152,19 @@ async def api_start(request: Request, body: dict = {}):
     except Exception:
         pass
     return {"status": "started", "pid": pid, "args": args}
+
+
+@app.post("/api/hdmi-config")
+async def api_hdmi_config(request: Request, body: dict = {}):
+    """即時套用 HDMI 設定（由 WebUI 單一管理，不需重啟主程序）。"""
+    err = _check_auth(request, "admin")
+    if err:
+        return JSONResponse({"ok": False, "error": err}, status_code=403)
+    try:
+        cfg = _apply_webui_hdmi_config(body)
+        return {"ok": True, "hdmi": cfg}
+    except Exception as e:
+        return JSONResponse({"ok": False, "error": str(e)}, status_code=400)
 
 
 @app.post("/api/switch-device")
@@ -1192,35 +1275,56 @@ def main():
     parser.add_argument("--port", type=int, default=WEB_PORT, help=f"HTTP port (預設 {WEB_PORT})")
     parser.add_argument("--no-browser", action="store_true", help="不自動開啟瀏覽器")
     parser.add_argument("--hdmi-output", action="store_true", help="啟用 HDMI 分割輸出（WebUI 啟動時即開啟）")
-    parser.add_argument("--hdmi-layout", default="grid", help="HDMI 版型：grid/focus_left/focus_top")
+    parser.add_argument(
+        "--hdmi-layout",
+        default="auto",
+        choices=["auto", "split2", "quad", "pip_tl", "pip_tr", "pip_bl", "pip_br", "full", "fullscreen"],
+        help="HDMI 版型：auto/split2/quad/pip_tl/pip_tr/pip_bl/pip_br/full",
+    )
     parser.add_argument("--hdmi-display", type=int, default=0, help="HDMI 顯示器編號（預設 0）")
     parser.add_argument("--hdmi-resolution", default="1920x1080", help="HDMI 解析度（預設 1920x1080）")
     parser.add_argument("--hdmi-fps", type=int, default=30, help="HDMI 輸出 FPS（預設 30）")
     parser.add_argument("--hdmi-source", action="append", default=[], help="HDMI 來源（可重複，最多 4 路）")
     args, _unknown = parser.parse_known_args()
 
-    # HDMI 分割輸出：WebUI 進入設定流程前即開啟，並在整個程序期間常駐
-    if args.hdmi_output:
-        if _TM_HDMIMultiviewOutput is None:
-            print("  [警告] 無法載入 HDMI 輸出模組，已略過")
-        else:
+    # HDMI 常駐輸出：WebUI 單一管理（優先採用 CLI 參數，否則讀取上次設定）
+    _startup_has_hdmi_arg = any(str(a).startswith("--hdmi-") for a in sys.argv[1:])
+    if _startup_has_hdmi_arg:
+        _startup_hdmi = {
+            "hdmi_enable": args.hdmi_output,
+            "hdmi_layout": args.hdmi_layout,
+            "hdmi_display": args.hdmi_display,
+            "hdmi_resolution": args.hdmi_resolution,
+            "hdmi_fps": args.hdmi_fps,
+            "hdmi_sources": args.hdmi_source or [],
+        }
+    else:
+        _startup_hdmi = {
+            "hdmi_enable": False,
+            "hdmi_layout": "auto",
+            "hdmi_display": 0,
+            "hdmi_resolution": "1920x1080",
+            "hdmi_fps": 30,
+            "hdmi_sources": [],
+        }
+        if CONFIG_FILE.exists():
             try:
-                _webui_hdmi_output = _TM_HDMIMultiviewOutput(
-                    layout=args.hdmi_layout,
-                    display=args.hdmi_display,
-                    resolution=args.hdmi_resolution,
-                    fps=args.hdmi_fps,
-                    sources=(args.hdmi_source or []),
-                )
-                _webui_hdmi_output.start()
-                print(
-                    "  [WebUI] HDMI 分割輸出已啟動: "
-                    f"版型={_webui_hdmi_output.layout}, 顯示器={_webui_hdmi_output.display}, "
-                    f"解析度={_webui_hdmi_output.width}x{_webui_hdmi_output.height}, 來源={len(_webui_hdmi_output.sources)}"
-                )
-            except Exception as e:
-                print(f"  [警告] 啟動 HDMI 分割輸出失敗: {e}")
-                _webui_hdmi_output = None
+                _cfg = json.loads(CONFIG_FILE.read_text(encoding="utf-8"))
+                _last = _cfg.get("webui_last", {})
+                _startup_hdmi.update({
+                    "hdmi_enable": _last.get("hdmi_enable", False),
+                    "hdmi_layout": _last.get("hdmi_layout", "auto"),
+                    "hdmi_display": _last.get("hdmi_display", 0),
+                    "hdmi_resolution": _last.get("hdmi_resolution", "1920x1080"),
+                    "hdmi_fps": _last.get("hdmi_fps", 30),
+                    "hdmi_sources": _last.get("hdmi_sources", []),
+                })
+            except Exception:
+                pass
+    try:
+        _apply_webui_hdmi_config(_startup_hdmi)
+    except Exception as e:
+        print(f"  [警告] 啟動 HDMI 分割輸出失敗: {e}")
 
     # 檢查 port 是否被佔用
     import socket as _check_sock

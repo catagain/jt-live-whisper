@@ -28,6 +28,14 @@
         "rec_audio_source": "both",
         "record_video": true,
         "video_device": "",
+        "hdmi_enable": true,
+        "hdmi_layout": "full",
+        "hdmi_display": 0,
+        "hdmi_resolution": "1920x1080",
+        "hdmi_fps": 30,
+        "hdmi_sources": [
+            "desktop"
+        ],
         "denoise": true,
         "diarize": false,
         "num_speakers": 0,
