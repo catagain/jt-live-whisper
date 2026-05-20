@@ -1045,6 +1045,23 @@ def _build_args(body: dict) -> list:
     if video_device:
         args.extend(["--video-device", video_device])
 
+    if body.get("record_video") and body.get("hdmi_enable"):
+        args.append("--record-hdmi")
+        hdmi_layout = body.get("hdmi_layout", "auto") or "auto"
+        args.extend(["--record-hdmi-layout", hdmi_layout])
+        hdmi_display = body.get("hdmi_display")
+        if hdmi_display is not None:
+            args.extend(["--record-hdmi-display", str(int(hdmi_display))])
+        hdmi_resolution = (body.get("hdmi_resolution") or "1920x1080").strip() or "1920x1080"
+        args.extend(["--record-hdmi-resolution", hdmi_resolution])
+        hdmi_fps = body.get("hdmi_fps")
+        if hdmi_fps is not None:
+            args.extend(["--record-hdmi-fps", str(int(hdmi_fps))])
+        for src in (body.get("hdmi_sources") or [])[:4]:
+            src = str(src).strip()
+            if src:
+                args.extend(["--record-hdmi-source", src])
+
     # HDMI 由 WebUI 常駐管理，不傳遞至子程序，避免重複輸出互搶。
 
     if body.get("mic"):

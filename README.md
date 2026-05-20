@@ -33,6 +33,7 @@
 - 即時錄音（--record）
 - 即時錄影（--record-video，可疊攝影機）
 - 即時 HDMI 分割輸出（最多 4 路來源）
+- HDMI 輸出與各來源可分別錄影並和本次 session 一起整理
 - 懸浮字幕（--subtitle-overlay）
 
 ### 離線能力
@@ -150,14 +151,24 @@ Windows:
 單一路桌面：
 
 ```bash
-./start.sh --hdmi-output --hdmi-source desktop
+./start.sh --hdmi-output --hdmi-layout full --hdmi-source desktop
 ```
 
-四分割（桌面+攝影機+串流+測試圖）：
+二分割（桌面 + 攝影機）：
 
 ```bash
 ./start.sh --hdmi-output \
-  --hdmi-layout grid \
+  --hdmi-layout split2 \
+  --hdmi-display 1 \
+  --hdmi-source desktop \
+  --hdmi-source camera
+```
+
+四分割（桌面 + 攝影機 + 串流 + 測試圖）：
+
+```bash
+./start.sh --hdmi-output \
+  --hdmi-layout quad \
   --hdmi-display 1 \
   --hdmi-resolution 1920x1080 \
   --hdmi-fps 30 \
@@ -167,11 +178,24 @@ Windows:
   --hdmi-source testsrc
 ```
 
-主畫面在左：
+子母畫面（右下角懸浮）：
 
 ```bash
-./start.sh --hdmi-output --hdmi-layout focus_left --hdmi-source desktop --hdmi-source camera
+./start.sh --hdmi-output --hdmi-layout pip_br --hdmi-source desktop --hdmi-source camera
 ```
+
+目前支援版型：
+
+- full / fullscreen：全畫面
+- split2：二分割
+- quad：四分割
+- pip_tl / pip_tr / pip_bl / pip_br：一大一小懸浮視窗
+- auto：依來源數自動切換
+
+補充：
+
+- 明確指定 split2 / quad / pip_* 時，就算來源不足也會保留版型，空位以黑底補齊。
+- PiP 版型使用 overlay 方式避免小視窗重疊閃爍。
 
 ---
 
@@ -195,6 +219,8 @@ WebUI 可以做的事：
 - 啟用講者辨識、摘要
 - 儲存前次設定
 - 檢視即時字幕、進度、輸出檔
+- 預覽 HDMI 版型，不必真的顯示即時影像也能看版位
+- 在預覽區直接拖曳來源，調整 HDMI 輸出位置與順序
 
 WebUI 進階功能：
 
@@ -203,6 +229,8 @@ WebUI 進階功能：
 - 懸浮字幕設定（字體比例、透明度、樣式）
 - 遠端密碼保護（唯讀/管理）
 - 即時切換音訊裝置與靜音控制
+- WebUI 為 HDMI 輸出的主要控制者，版型切換時會維持 HDMI 視窗存在並套用新設定
+- 開啟錄影時，可一併錄下 HDMI 合成畫面與各個 HDMI 來源
 
 WebUI 啟動參數：
 
@@ -291,11 +319,17 @@ WebUI 啟動參數：
 ### HDMI
 
 - --hdmi-output
-- --hdmi-layout {grid, focus_left, focus_top}
+- --hdmi-layout {auto, full, split2, quad, pip_tl, pip_tr, pip_bl, pip_br}
 - --hdmi-display ID
 - --hdmi-resolution WxH
 - --hdmi-fps FPS
 - --hdmi-source SRC（可重複）
+- --record-hdmi
+- --record-hdmi-layout
+- --record-hdmi-display
+- --record-hdmi-resolution
+- --record-hdmi-fps
+- --record-hdmi-source SRC（可重複）
 
 ### 離線/摘要/字幕輸出
 
@@ -327,8 +361,15 @@ WebUI 啟動參數：
 - *.srt：字幕檔
 - *.vtt：字幕檔
 - 摘要_*.txt / 摘要_*.html：摘要與校正結果
+- 錄影_*.mp4：主錄影
+- 錄影_HDMI輸出_*.mkv：HDMI 合成輸出錄影
+- 錄影_來源1_*.mkv ~ 錄影_來源4_*.mkv：各來源獨立錄影
+- 錄音_*.mp3：本次 session 的音訊輸出
 
-錄音/錄影輸出到 recordings/。
+目前規則：
+
+- 即時模式結束後，會把本次需要交付的輸出集中整理到 logs/<session>/。
+- recordings/ 主要作為錄製過程中的原始檔或暫存工作區。
 
 ---
 

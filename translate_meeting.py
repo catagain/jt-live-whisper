@@ -15,6 +15,7 @@ import math
 import os
 import re
 import signal
+import shutil
 import subprocess
 import sys
 import threading
@@ -4164,6 +4165,8 @@ def run_stream(capture_id: int, translator, model_name: str, model_path: str,
     log_filename = datetime.now().strftime(f"{log_prefix}{topic_part}_%Y%m%d_%H%M%S.txt")
     os.makedirs(LOG_DIR, exist_ok=True)
     log_path = os.path.join(LOG_DIR, log_filename)
+    session_output_dir = os.path.join(LOG_DIR, os.path.splitext(log_filename)[0])
+    os.makedirs(session_output_dir, exist_ok=True)
 
     # 錄音（獨立 InputStream 平行讀裝置）
     # 注意：capture_id 是 SDL2 裝置 ID（whisper-stream 用），
@@ -4172,11 +4175,11 @@ def run_stream(capture_id: int, translator, model_name: str, model_path: str,
     rec_stream = None
     _rec_stream_mic = None   # Windows 混合錄音的麥克風串流
     _mixer = None            # Windows 混合錄音的 mixer
-    video_recorder = None
     hdmi_output = None
+    aux_video_recorders = []
     if record_video:
         try:
-            video_recorder = _VideoRecorder(topic=meeting_topic, camera_name=video_device)
+            video_recorder = _VideoRecorder(topic=meeting_topic, camera_name=video_device, output_dir=session_output_dir)
             print(f"  {C_DIM}錄影: {video_recorder.path}{RESET}")
         except Exception as e:
             print(f"{C_HIGHLIGHT}[警告] 無法啟動影片錄製: {e}{RESET}")
@@ -4195,6 +4198,36 @@ def run_stream(capture_id: int, translator, model_name: str, model_path: str,
         except Exception as e:
             print(f"{C_HIGHLIGHT}[警告] 無法啟用 HDMI 分割輸出: {e}{RESET}")
             hdmi_output = None
+    if record_video and hdmi_output_config and hdmi_output_config.get("record_enabled"):
+        try:
+            record_helper = _HDMIMultiviewOutput(
+                layout=hdmi_output_config.get("record_layout", hdmi_output_config.get("layout", "auto")),
+                display=hdmi_output_config.get("record_display", hdmi_output_config.get("display", 0)),
+                resolution=hdmi_output_config.get("record_resolution", hdmi_output_config.get("resolution", "1920x1080")),
+                fps=hdmi_output_config.get("record_fps", hdmi_output_config.get("fps", 30)),
+                sources=hdmi_output_config.get("record_sources", hdmi_output_config.get("sources", [])),
+                require_ffplay=False,
+            )
+
+            def _build_hdmi_record_cmd(out_path, _helper=record_helper):
+                return _helper._build_ffmpeg_command(output_target=out_path, output_muxer=None)
+
+            hdmi_rec = _AuxVideoRecorder("HDMI輸出", _build_hdmi_record_cmd, topic=meeting_topic, suffix="mkv", output_dir=session_output_dir)
+            aux_video_recorders.append(hdmi_rec)
+            print(f"  {C_DIM}HDMI 錄影: {hdmi_rec.path}{RESET}")
+        except Exception as e:
+            print(f"{C_HIGHLIGHT}[警告] 無法啟動 HDMI 影片錄製: {e}{RESET}")
+
+        for idx, src_spec in enumerate((hdmi_output_config.get("record_sources") or [])[:4], 1):
+            try:
+                def _build_src_record_cmd(out_path, _src_spec=src_spec, _fps=hdmi_output_config.get("record_fps", hdmi_output_config.get("fps", 30))):
+                    return _build_source_record_segment_cmd(_src_spec, out_path, fps=_fps)
+
+                src_rec = _AuxVideoRecorder(f"來源{idx}", _build_src_record_cmd, topic=meeting_topic, suffix="mkv", output_dir=session_output_dir)
+                aux_video_recorders.append(src_rec)
+                print(f"  {C_DIM}來源錄影[{idx}]: {src_rec.path}{RESET}")
+            except Exception as e:
+                print(f"{C_HIGHLIGHT}[警告] 無法啟動來源 {idx} 影片錄製: {e}{RESET}")
     if record:
         import sounddevice as sd
         import numpy as np
@@ -4314,6 +4347,8 @@ def run_stream(capture_id: int, translator, model_name: str, model_path: str,
     # 啟動錄影與錄音串流（盡量同時，確保影音同步）
     if video_recorder:
         video_recorder.start()
+    for rec in aux_video_recorders:
+        rec.start()
     if hdmi_output:
         hdmi_output.start()
     if rec_stream:
@@ -4388,6 +4423,15 @@ def run_stream(capture_id: int, translator, model_name: str, model_path: str,
                 print(f"\n  {C_OK}✓ 錄影已儲存: {video_path}{RESET}", flush=True)
             except Exception as e:
                 print(f"\n{C_HIGHLIGHT}[警告] 影片錄製或合併失敗: {e}{RESET}", flush=True)
+        extra_video_paths = []
+        for rec in aux_video_recorders:
+            try:
+                rec_path = rec.finalize()
+                if rec_path:
+                    extra_video_paths.append(rec_path)
+                    print(f"  {C_OK}✓ 額外影片已儲存: {rec_path}{RESET}", flush=True)
+            except Exception as e:
+                print(f"\n{C_HIGHLIGHT}[警告] 額外影片錄製失敗: {e}{RESET}", flush=True)
         if hdmi_output:
             try:
                 hdmi_output.stop()
@@ -4399,6 +4443,7 @@ def run_stream(capture_id: int, translator, model_name: str, model_path: str,
             segments_data=realtime_segments,
             audio_paths=[final_audio_path] if final_audio_path else [],
             video_path=video_path,
+            extra_video_paths=extra_video_paths,
             meeting_topic=meeting_topic,
         )
         _run_realtime_postprocess(
@@ -4824,6 +4869,8 @@ def run_stream_moonshine(capture_id: int, translator, moonshine_model_name: str,
     log_filename = datetime.now().strftime(f"{log_prefix}{topic_part}_%Y%m%d_%H%M%S.txt")
     os.makedirs(LOG_DIR, exist_ok=True)
     log_path = os.path.join(LOG_DIR, log_filename)
+    session_output_dir = os.path.join(LOG_DIR, os.path.splitext(log_filename)[0])
+    os.makedirs(session_output_dir, exist_ok=True)
 
     # 錄音（實際建立延後到取得 samplerate 之後）
     recorder = None
@@ -5827,6 +5874,8 @@ def run_stream_remote(capture_id: int, translator, model_name: str,
     # ── 啟動錄影與音訊串流（盡量同時，確保影音同步）──
     if video_recorder:
         video_recorder.start()
+    for rec in aux_video_recorders:  # Start auxiliary video recorders
+        rec.start()
     if hdmi_output:
         hdmi_output.start()
     sd_stream.start()
@@ -6726,6 +6775,8 @@ def run_stream_bidirectional(lb_device_id, mic_device_id,
     log_filename = datetime.now().strftime(f"{log_prefix}{topic_part}_%Y%m%d_%H%M%S.txt")
     os.makedirs(LOG_DIR, exist_ok=True)
     log_path = os.path.join(LOG_DIR, log_filename)
+    session_output_dir = os.path.join(LOG_DIR, os.path.splitext(log_filename)[0])
+    os.makedirs(session_output_dir, exist_ok=True)
 
     # ── 載入 ASR 模型（mlx-whisper 或 faster-whisper）──
     fw_model = None        # faster-whisper model（use_mlx=False 時使用）
@@ -6943,9 +6994,10 @@ def run_stream_bidirectional(lb_device_id, mic_device_id,
     recorder_mic = None
     video_recorder = None
     hdmi_output = None
+    aux_video_recorders = []
     if record_video:
         try:
-            video_recorder = _VideoRecorder(topic=meeting_topic, camera_name=video_device)
+            video_recorder = _VideoRecorder(topic=meeting_topic, camera_name=video_device, output_dir=session_output_dir)
             print(f"  {C_DIM}錄影: {video_recorder.path}{RESET}")
         except Exception as e:
             print(f"{C_HIGHLIGHT}[警告] 無法啟動影片錄製: {e}{RESET}")
@@ -6964,6 +7016,37 @@ def run_stream_bidirectional(lb_device_id, mic_device_id,
         except Exception as e:
             print(f"{C_HIGHLIGHT}[警告] 無法啟用 HDMI 分割輸出: {e}{RESET}")
             hdmi_output = None
+
+    if record_video and hdmi_output_config and hdmi_output_config.get("record_enabled"):
+        try:
+            record_helper = _HDMIMultiviewOutput(
+                layout=hdmi_output_config.get("record_layout", hdmi_output_config.get("layout", "auto")),
+                display=hdmi_output_config.get("record_display", hdmi_output_config.get("display", 0)),
+                resolution=hdmi_output_config.get("record_resolution", hdmi_output_config.get("resolution", "1920x1080")),
+                fps=hdmi_output_config.get("record_fps", hdmi_output_config.get("fps", 30)),
+                sources=hdmi_output_config.get("record_sources", hdmi_output_config.get("sources", [])),
+                require_ffplay=False,
+            )
+
+            def _build_hdmi_record_cmd(out_path, _helper=record_helper):
+                return _helper._build_ffmpeg_command(output_target=out_path, output_muxer=None)
+
+            hdmi_rec = _AuxVideoRecorder("HDMI輸出", _build_hdmi_record_cmd, topic=meeting_topic, suffix="mkv", output_dir=session_output_dir)
+            aux_video_recorders.append(hdmi_rec)
+            print(f"  {C_DIM}HDMI 錄影: {hdmi_rec.path}{RESET}")
+        except Exception as e:
+            print(f"{C_HIGHLIGHT}[警告] 無法啟動 HDMI 影片錄製: {e}{RESET}")
+
+        for idx, src_spec in enumerate((hdmi_output_config.get("record_sources") or [])[:4], 1):
+            try:
+                def _build_src_record_cmd(out_path, _src_spec=src_spec, _fps=hdmi_output_config.get("record_fps", hdmi_output_config.get("fps", 30))):
+                    return _build_source_record_segment_cmd(_src_spec, out_path, fps=_fps)
+
+                src_rec = _AuxVideoRecorder(f"來源{idx}", _build_src_record_cmd, topic=meeting_topic, suffix="mkv", output_dir=session_output_dir)
+                aux_video_recorders.append(src_rec)
+                print(f"  {C_DIM}來源錄影[{idx}]: {src_rec.path}{RESET}")
+            except Exception as e:
+                print(f"{C_HIGHLIGHT}[警告] 無法啟動來源 {idx} 影片錄製: {e}{RESET}")
     if record:
         recorder_lb = _AudioRecorder(lb_sr, topic=f"{meeting_topic or ''}_系統音訊".lstrip("_"), mode=mode)
         recorder_mic = _AudioRecorder(mic_sr, topic=f"{meeting_topic or ''}_麥克風".lstrip("_"), mode=mode)
@@ -7741,6 +7824,15 @@ def run_stream_bidirectional(lb_device_id, mic_device_id,
                 print(f"  {C_OK}錄影已儲存: {video_path}{RESET}", flush=True)
             except Exception as e:
                 print(f"  {C_HIGHLIGHT}[警告] 影片錄製或合併失敗: {e}{RESET}", flush=True)
+        extra_video_paths = []  # Initialize list for extra video paths
+        for rec in aux_video_recorders:  # Finalize auxiliary video recorders
+            try:
+                rec_path = rec.finalize()
+                if rec_path:
+                    extra_video_paths.append(rec_path)
+                    print(f"  {C_OK}額外影片已儲存: {rec_path}{RESET}", flush=True)
+            except Exception as e:
+                print(f"  {C_HIGHLIGHT}[警告] 額外影片錄製失敗: {e}{RESET}", flush=True)
         if hdmi_output:
             try:
                 hdmi_output.stop()
@@ -7752,6 +7844,7 @@ def run_stream_bidirectional(lb_device_id, mic_device_id,
             segments_data=realtime_segments,
             audio_paths=[path for path in (p1, p2) if path],
             video_path=video_path,
+            extra_video_paths=extra_video_paths,  # Include extra video paths
             meeting_topic=meeting_topic,
         )
         _run_realtime_postprocess(
@@ -7801,6 +7894,8 @@ def run_stream_bidirectional(lb_device_id, mic_device_id,
     # ── 啟動錄影與音訊串流（盡量同時，確保影音同步）──
     if video_recorder:
         video_recorder.start()
+    for rec in aux_video_recorders:
+        rec.start()
     if hdmi_output:
         hdmi_output.start()
     lb_stream.start()
@@ -8071,6 +8166,108 @@ def _topic_to_filename_part(topic):
     return f"_{safe}" if safe else ""
 
 
+def _parse_hdmi_source_spec(spec):
+    s = (spec or "").strip()
+    if not s:
+        return {"kind": "black"}
+    low = s.lower()
+
+    if low == "desktop":
+        return {"kind": "desktop"}
+    if low.startswith("camera"):
+        name = ""
+        if ":" in s:
+            name = s.split(":", 1)[1].strip()
+        elif "=" in s:
+            name = s.split("=", 1)[1].strip()
+        return {"kind": "camera", "name": name}
+    if low.startswith("testsrc"):
+        label = ""
+        if ":" in s:
+            label = s.split(":", 1)[1].strip()
+        return {"kind": "testsrc", "label": label}
+    if low.startswith("file:"):
+        return {"kind": "file", "path": s.split(":", 1)[1].strip()}
+    if low.startswith(("rtsp://", "http://", "https://", "udp://")):
+        return {"kind": "url", "url": s}
+    return {"kind": "file", "path": s}
+
+
+def _detect_default_hdmi_camera():
+    if not IS_WINDOWS:
+        return None
+    ffmpeg = shutil.which("ffmpeg")
+    if not ffmpeg:
+        return None
+    cmd = [ffmpeg, "-hide_banner", "-loglevel", "error",
+           "-list_devices", "true", "-f", "dshow", "-i", "dummy"]
+    try:
+        proc = subprocess.run(cmd, capture_output=True, text=True, **_SUBPROCESS_FLAGS)
+        lines = proc.stderr.splitlines()
+    except Exception:
+        return None
+
+    video_devices = []
+    in_video = False
+    for line in lines:
+        if "DirectShow video devices" in line:
+            in_video = True
+            continue
+        if "DirectShow audio devices" in line:
+            in_video = False
+            continue
+        if in_video and '"' in line:
+            name = line.strip().strip('"')
+            if name:
+                video_devices.append(name)
+    return video_devices[0] if video_devices else None
+
+
+def _hdmi_source_input_args(src, fps, width, height):
+    kind = src.get("kind")
+    if kind == "desktop":
+        if IS_WINDOWS:
+            return ["-f", "gdigrab", "-framerate", str(fps), "-i", "desktop"]
+        return ["-f", "avfoundation", "-framerate", str(fps), "-i", "1:none"]
+    if kind == "camera":
+        if IS_WINDOWS:
+            name = src.get("name") or _detect_default_hdmi_camera()
+            if not name:
+                raise RuntimeError("找不到可用攝影機，請指定 --record-hdmi-source camera:裝置名稱")
+            return ["-f", "dshow", "-i", f"video={name}"]
+        return ["-f", "avfoundation", "-framerate", str(fps), "-i", "0:none"]
+    if kind == "black":
+        return ["-f", "lavfi", "-i", f"color=size={width}x{height}:rate={fps}:color=black"]
+    if kind == "testsrc":
+        return ["-f", "lavfi", "-i", f"testsrc2=size={width}x{height}:rate={fps}"]
+    if kind == "url":
+        return ["-i", src.get("url", "")]
+    if kind == "file":
+        return ["-stream_loop", "-1", "-re", "-i", src.get("path", "")]
+    return ["-f", "lavfi", "-i", f"color=size={width}x{height}:rate={fps}:color=black"]
+
+
+def _build_source_record_segment_cmd(source_spec, out_path, fps=15):
+    src = _parse_hdmi_source_spec(source_spec)
+    ffmpeg = shutil.which("ffmpeg")
+    if not ffmpeg:
+        raise RuntimeError("找不到 ffmpeg，無法錄製來源影片")
+
+    width = 1920
+    height = 1080
+    cmd = [ffmpeg, "-y", "-hide_banner", "-loglevel", "error"]
+    cmd.extend(_hdmi_source_input_args(src, fps, width, height))
+    cmd.extend([
+        "-c:v", "libx264",
+        "-preset", "ultrafast",
+        "-crf", "23",
+        "-pix_fmt", "yuv420p",
+        "-r", str(fps),
+        out_path,
+    ])
+    return cmd
+
+
 class _AudioRecorder:
     """將即時模式的音訊錄製為 16-bit PCM WAV 檔。
     定期更新 WAV header，即使程式異常終止也能保留已錄製的音訊。
@@ -8249,7 +8446,7 @@ class _AudioRecorder:
 class _VideoRecorder:
     """錄製螢幕與攝影機畫面，暫停時切分片段，結束後合併成 MP4。"""
 
-    def __init__(self, topic=None, camera_name=None, framerate=15):
+    def __init__(self, topic=None, camera_name=None, framerate=15, output_dir=None):
         import datetime as _datetime
         import shutil as _shutil
 
@@ -8257,10 +8454,11 @@ class _VideoRecorder:
         if not self._ffmpeg:
             raise RuntimeError("找不到 ffmpeg，無法錄製影片")
 
-        os.makedirs(RECORDING_DIR, exist_ok=True)
+        output_dir = output_dir or RECORDING_DIR
+        os.makedirs(output_dir, exist_ok=True)
         topic_part = _topic_to_filename_part(topic)
         self.path = _datetime.datetime.now().strftime(f"錄影{topic_part}_%Y%m%d_%H%M%S.mp4")
-        self.path = os.path.join(RECORDING_DIR, self.path)
+        self.path = os.path.join(output_dir, self.path)
         self._tmp_base = os.path.splitext(self.path)[0] + "_tmp"
         self._camera_name = camera_name or self._detect_default_camera()
         self._framerate = framerate
@@ -8581,20 +8779,224 @@ class _VideoRecorder:
             return merged_path
 
 
+class _AuxVideoRecorder:
+    """錄製額外影片輸出（例如 HDMI 輸出或單一路來源）。
+
+    只處理影片，不額外混音；支援 pause / resume 以維持與主錄影相同的片段切分。
+    """
+
+    def __init__(self, name, build_segment_cmd, topic=None, suffix="mkv", output_dir=None):
+        import datetime as _datetime
+
+        self._ffmpeg = shutil.which("ffmpeg")
+        if not self._ffmpeg:
+            raise RuntimeError("找不到 ffmpeg，無法錄製影片")
+
+        output_dir = output_dir or RECORDING_DIR
+        os.makedirs(output_dir, exist_ok=True)
+        topic_part = _topic_to_filename_part(topic)
+        safe_name = re.sub(r'[\\/:*?"<>|\x00-\x1f\s]+', '_', str(name or "video")).strip('_')
+        safe_name = safe_name[:20] or "video"
+        self.path = _datetime.datetime.now().strftime(f"錄影_{safe_name}{topic_part}_%Y%m%d_%H%M%S.{suffix}")
+        self.path = os.path.join(output_dir, self.path)
+        self._tmp_base = os.path.splitext(self.path)[0] + "_tmp"
+        self._build_segment_cmd = build_segment_cmd
+        self._seg_paths = []
+        self._all_seg_paths = []
+        self._seg_idx = 0
+        self._current_seg_path = None
+        self._paused = False
+        self._ctrl_lock = threading.Lock()
+        self._proc = None
+        self._started = False
+
+    def start(self):
+        with self._ctrl_lock:
+            if self._started:
+                return
+            self._started = True
+            self._start_new_segment()
+
+    def _next_seg_path(self):
+        p = f"{self._tmp_base}_seg{self._seg_idx:04d}.mkv"
+        self._seg_idx += 1
+        self._all_seg_paths.append(p)
+        return p
+
+    def _start_ffmpeg(self, out_path):
+        cmd = self._build_segment_cmd(out_path)
+        try:
+            return subprocess.Popen(
+                cmd,
+                stdin=subprocess.PIPE,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                **_SUBPROCESS_FLAGS,
+            )
+        except Exception as e:
+            raise RuntimeError(f"無法啟動 ffmpeg 錄影: {e}")
+
+    def _start_new_segment(self):
+        self._current_seg_path = self._next_seg_path()
+        self._proc = self._start_ffmpeg(self._current_seg_path)
+
+    def _stop_current_segment(self):
+        if self._proc is None:
+            return
+        try:
+            if self._proc.poll() is None:
+                sent_quit = False
+                try:
+                    if self._proc.stdin:
+                        try:
+                            self._proc.stdin.write(b"q\n")
+                        except TypeError:
+                            self._proc.stdin.write("q\n")
+                        self._proc.stdin.flush()
+                        sent_quit = True
+                except Exception:
+                    sent_quit = False
+
+                if sent_quit:
+                    try:
+                        if self._proc.stdin:
+                            self._proc.stdin.close()
+                    except Exception:
+                        pass
+                    self._proc.wait(timeout=20)
+                else:
+                    self._proc.terminate()
+                    self._proc.wait(timeout=5)
+        except Exception:
+            try:
+                self._proc.kill()
+            except Exception:
+                pass
+        finally:
+            self._proc = None
+        if self._current_seg_path and os.path.exists(self._current_seg_path):
+            try:
+                if os.path.getsize(self._current_seg_path) > 0:
+                    self._seg_paths.append(self._current_seg_path)
+            except OSError:
+                pass
+        self._current_seg_path = None
+
+    def pause(self):
+        with self._ctrl_lock:
+            if self._paused:
+                return
+            self._stop_current_segment()
+            self._paused = True
+
+    def resume(self):
+        with self._ctrl_lock:
+            if not self._paused:
+                return
+            self._start_new_segment()
+            self._paused = False
+
+    def stop(self):
+        with self._ctrl_lock:
+            self._stop_current_segment()
+
+    def _cleanup_temp_files(self, keep_paths=None):
+        keep = set([p for p in (keep_paths or []) if p])
+        temp_paths = set(self._all_seg_paths)
+        if self._current_seg_path:
+            temp_paths.add(self._current_seg_path)
+        for p in temp_paths:
+            if not p or p in keep:
+                continue
+            try:
+                if os.path.exists(p):
+                    os.remove(p)
+            except OSError:
+                pass
+
+    def finalize(self):
+        self.stop()
+        valid_seg_paths = []
+        for p in self._seg_paths:
+            try:
+                if p and os.path.exists(p) and os.path.getsize(p) > 0:
+                    valid_seg_paths.append(p)
+            except OSError:
+                pass
+        self._seg_paths = valid_seg_paths
+
+        if not self._seg_paths:
+            raise RuntimeError("影片暫存檔不存在，錄影失敗")
+
+        print(f"  [DEBUG] 開始合併 {len(self._seg_paths)} 個額外影片片段...", flush=True)
+        merged_path = self._seg_paths[0]
+        concat_list = None
+        if len(self._seg_paths) > 1:
+            concat_list = f"{self._tmp_base}_concat.txt"
+            merged_path = f"{self._tmp_base}_merged.mkv"
+            try:
+                with open(concat_list, "w", encoding="utf-8") as f:
+                    for p in self._seg_paths:
+                        norm = p.replace("\\", "/")
+                        f.write(f"file '{norm.replace("'", "'\\''")}'\n")
+                subprocess.run([self._ffmpeg, "-y", "-hide_banner", "-loglevel", "error",
+                                "-f", "concat", "-safe", "0", "-i", concat_list,
+                                "-c", "copy", merged_path],
+                               check=True, stdout=subprocess.PIPE,
+                               stderr=subprocess.PIPE, text=False, **_SUBPROCESS_FLAGS)
+            except Exception:
+                recode_cmd = [self._ffmpeg, "-y", "-hide_banner", "-loglevel", "error"]
+                for seg in self._seg_paths:
+                    recode_cmd += ["-i", seg]
+                concat_inputs = "".join([f"[{i}:v]" for i in range(len(self._seg_paths))])
+                recode_cmd += [
+                    "-filter_complex", f"{concat_inputs}concat=n={len(self._seg_paths)}:v=1:a=0[outv]",
+                    "-map", "[outv]",
+                    "-c:v", "libx264", "-preset", "veryfast", "-crf", "23",
+                    "-pix_fmt", "yuv420p", "-an",
+                    merged_path,
+                ]
+                subprocess.run(recode_cmd, check=True, stdout=subprocess.PIPE,
+                                   stderr=subprocess.PIPE, text=False, **_SUBPROCESS_FLAGS)
+
+        if merged_path != self.path:
+            try:
+                shutil.copyfile(merged_path, self.path)
+            except Exception:
+                subprocess.run([
+                    self._ffmpeg, "-y", "-hide_banner", "-loglevel", "error",
+                    "-i", merged_path, "-c:v", "copy", "-an", self.path
+                ], check=True, stdout=subprocess.PIPE,
+                   stderr=subprocess.PIPE, text=False, **_SUBPROCESS_FLAGS)
+
+        self._cleanup_temp_files([merged_path, self.path])
+        if concat_list and os.path.exists(concat_list):
+            try:
+                os.remove(concat_list)
+            except OSError:
+                pass
+        if merged_path.endswith("_merged.mkv") and os.path.exists(merged_path):
+            try:
+                os.remove(merged_path)
+            except OSError:
+                pass
+        return self.path
+
+
 class _HDMIMultiviewOutput:
     """即時多路分割輸出到指定顯示器（最多 4 路）。
 
     透過 ffmpeg 合成分割畫面，再用 ffplay 全螢幕顯示，供 HDMI 外接顯示器輸出。
     """
 
-    def __init__(self, layout="auto", display=0, resolution="1920x1080", fps=30, sources=None):
+    def __init__(self, layout="auto", display=0, resolution="1920x1080", fps=30, sources=None, require_ffplay=True):
         import shutil as _shutil
 
         self._ffmpeg = _shutil.which("ffmpeg")
         self._ffplay = _shutil.which("ffplay")
         if not self._ffmpeg:
             raise RuntimeError("找不到 ffmpeg，無法啟用 HDMI 分割輸出")
-        if not self._ffplay:
+        if require_ffplay and not self._ffplay:
             raise RuntimeError("找不到 ffplay，無法啟用 HDMI 分割輸出")
 
         self.layout = layout or "auto"
@@ -8728,6 +9130,11 @@ class _HDMIMultiviewOutput:
             small_h = max(90, int(h * 0.28))
             margin = max(12, int(min(w, h) * 0.03))
 
+            # yuv420p/x264 對奇數尺寸與座標容忍度較差，PiP 一律對齊偶數避免 sender 啟動失敗。
+            small_w = max(2, small_w - (small_w % 2))
+            small_h = max(2, small_h - (small_h % 2))
+            margin = max(0, margin - (margin % 2))
+
             if layout == "pip_tl":
                 x, y = margin, margin
             elif layout == "pip_tr":
@@ -8736,6 +9143,9 @@ class _HDMIMultiviewOutput:
                 x, y = margin, h - small_h - margin
             else:  # pip_br
                 x, y = w - small_w - margin, h - small_h - margin
+
+            x = max(0, int(x) - (int(x) % 2))
+            y = max(0, int(y) - (int(y) % 2))
 
             return [
                 (0, 0, w, h),
@@ -8780,7 +9190,8 @@ class _HDMIMultiviewOutput:
             return 4
         return 0  # auto：依來源數自適應
 
-    def _build_ffmpeg_command(self):
+    def _build_ffmpeg_command(self, output_target=None, output_muxer="mpegts"):
+        current_layout = (self.layout or "auto").lower()
         parsed_sources = [self._parse_source(s) for s in self.sources]
         natural = self._layout_natural_count()
         if natural > 0:
@@ -8809,6 +9220,20 @@ class _HDMIMultiviewOutput:
                 f"scale={sw}:{sh}:force_original_aspect_ratio=decrease,"
                 f"pad={sw}:{sh}:(ow-iw)/2:(oh-ih)/2,setsar=1[outv]"
             )
+        elif current_layout in ("pip_tl", "pip_tr", "pip_bl", "pip_br") and count >= 2:
+            # PiP 有重疊區，改用 overlay 讓小窗永遠覆蓋主畫面，避免 xstack 在重疊處閃爍。
+            for i in (0, 1):
+                _, _, sw, sh = slots[i]
+                sw = max(16, int(sw))
+                sh = max(16, int(sh))
+                filters.append(
+                    f"[{i}:v]fps={self.fps},"
+                    f"scale={sw}:{sh}:force_original_aspect_ratio=decrease,"
+                    f"pad={sw}:{sh}:(ow-iw)/2:(oh-ih)/2,setsar=1[v{i}]"
+                )
+
+            x, y = int(slots[1][0]), int(slots[1][1])
+            filters.append(f"[v0][v1]overlay={x}:{y}:eof_action=pass[outv]")
         else:
             layout_parts = []
             for i, (_, _, sw, sh) in enumerate(slots):
@@ -8838,9 +9263,10 @@ class _HDMIMultiviewOutput:
             "-pix_fmt", "yuv420p",
             "-r", str(self.fps),
             "-g", str(max(1, self.fps)),
-            "-f", "mpegts",
-            self._udp_url,
         ])
+        if output_muxer:
+            cmd.extend(["-f", output_muxer])
+        cmd.append(output_target or self._udp_url)
         return cmd
 
     def _build_ffplay_command(self):
@@ -10271,7 +10697,7 @@ def _copy_path_into_dir(path, session_dir):
 
 
 def _package_realtime_outputs(log_path, mode, segments_data=None, audio_paths=None,
-                              video_path="", meeting_topic=None):
+                              video_path="", extra_video_paths=None, meeting_topic=None):
     """將即時模式輸出整理成離線模式相近的 session 資料夾。"""
     result = {
         "log_path": log_path or "",
@@ -10300,7 +10726,12 @@ def _package_realtime_outputs(log_path, mode, segments_data=None, audio_paths=No
         moved_audio = _copy_path_into_dir(audio_path, session_dir)
         if moved_audio:
             moved_audio_paths.append(moved_audio)
-    moved_video_path = _copy_path_into_dir(video_path, session_dir) if video_path else ""
+    moved_video_path = _move_path_into_dir(video_path, session_dir) if video_path else ""
+    moved_extra_video_paths = []
+    for extra_video_path in extra_video_paths or []:
+        moved_extra_video = _move_path_into_dir(extra_video_path, session_dir)
+        if moved_extra_video:
+            moved_extra_video_paths.append(moved_extra_video)
     primary_media_path = moved_video_path or (moved_audio_paths[0] if moved_audio_paths else "")
 
     transcript_html_path = ""
@@ -10345,6 +10776,7 @@ def _package_realtime_outputs(log_path, mode, segments_data=None, audio_paths=No
         "session_dir": session_dir,
         "audio_paths": moved_audio_paths,
         "video_path": moved_video_path,
+        "extra_video_paths": moved_extra_video_paths,
         "primary_media_path": primary_media_path,
         "transcript_html_path": transcript_html_path,
         "srt_path": srt_path,
@@ -14144,6 +14576,25 @@ def parse_args():
         "--hdmi-source", action="append", dest="hdmi_sources", metavar="SRC",
         help="HDMI 畫面來源（可重複最多 4 次，例如 desktop、camera、camera:OBS Virtual Camera、file:C:/demo.mp4、rtsp://...）")
     parser.add_argument(
+        "--record-hdmi", action="store_true",
+        help="即時模式同時錄製 HDMI 分割輸出為影片（存入 recordings/）")
+    parser.add_argument(
+        "--record-hdmi-layout", choices=["auto", "split2", "quad", "pip_tl", "pip_tr", "pip_bl", "pip_br", "full", "fullscreen"],
+        default=None, metavar="LAYOUT",
+        help="HDMI 影片錄製版型（預設沿用 --hdmi-layout）")
+    parser.add_argument(
+        "--record-hdmi-display", type=int, default=None, metavar="ID",
+        help="HDMI 影片錄製顯示器編號（預設沿用 --hdmi-display）")
+    parser.add_argument(
+        "--record-hdmi-resolution", default=None, metavar="WxH",
+        help="HDMI 影片錄製解析度（預設沿用 --hdmi-resolution）")
+    parser.add_argument(
+        "--record-hdmi-fps", type=int, default=None, metavar="FPS",
+        help="HDMI 影片錄製幀率（預設沿用 --hdmi-fps）")
+    parser.add_argument(
+        "--record-hdmi-source", action="append", dest="record_hdmi_sources", metavar="SRC",
+        help="HDMI 影片錄製來源（可重複最多 4 次；未指定時沿用 --hdmi-source）")
+    parser.add_argument(
         "--rec-device", type=int, metavar="ID",
         help="錄音裝置 ID (可與 ASR 裝置不同，例如聚集裝置可同時錄雙方聲音)")
     parser.add_argument(
@@ -14367,6 +14818,24 @@ def _build_cli_command(**kwargs):
         hdmi_sources = kwargs.get("hdmi_sources") or []
         for src in hdmi_sources[:4]:
             parts.append(f"--hdmi-source {shlex.quote(str(src))}")
+    record_hdmi = kwargs.get("record_hdmi")
+    if record_hdmi:
+        parts.append("--record-hdmi")
+        record_hdmi_layout = kwargs.get("record_hdmi_layout")
+        if record_hdmi_layout:
+            parts.append(f"--record-hdmi-layout {record_hdmi_layout}")
+        record_hdmi_display = kwargs.get("record_hdmi_display")
+        if record_hdmi_display is not None:
+            parts.append(f"--record-hdmi-display {int(record_hdmi_display)}")
+        record_hdmi_resolution = kwargs.get("record_hdmi_resolution")
+        if record_hdmi_resolution:
+            parts.append(f"--record-hdmi-resolution {shlex.quote(record_hdmi_resolution)}")
+        record_hdmi_fps = kwargs.get("record_hdmi_fps")
+        if record_hdmi_fps is not None:
+            parts.append(f"--record-hdmi-fps {int(record_hdmi_fps)}")
+        record_hdmi_sources = kwargs.get("record_hdmi_sources") or []
+        for src in record_hdmi_sources[:4]:
+            parts.append(f"--record-hdmi-source {shlex.quote(str(src))}")
 
     rec_device = kwargs.get("rec_device")
     if rec_device is not None:
@@ -14390,19 +14859,36 @@ def _build_cli_command(**kwargs):
 def _build_hdmi_output_config(args):
     """從 CLI args 產生 HDMI 分割輸出設定。"""
     if not getattr(args, "hdmi_output", False):
-        return {"enabled": False}
+        enabled = False
+    else:
+        enabled = True
     _src = []
     for s in (getattr(args, "hdmi_sources", None) or []):
         s = str(s).strip()
         if s:
             _src.append(s)
+    _record_src = []
+    _record_raw = getattr(args, "record_hdmi_sources", None) or []
+    if _record_raw:
+        for s in _record_raw:
+            s = str(s).strip()
+            if s:
+                _record_src.append(s)
+    else:
+        _record_src = list(_src)
     return {
-        "enabled": True,
+        "enabled": enabled,
         "layout": getattr(args, "hdmi_layout", "auto") or "auto",
         "display": int(getattr(args, "hdmi_display", 0) or 0),
         "resolution": getattr(args, "hdmi_resolution", "1920x1080") or "1920x1080",
         "fps": int(getattr(args, "hdmi_fps", 30) or 30),
         "sources": _src[:4],
+        "record_enabled": bool(getattr(args, "record_hdmi", False)),
+        "record_layout": getattr(args, "record_hdmi_layout", None) or getattr(args, "hdmi_layout", "auto") or "auto",
+        "record_display": int(getattr(args, "record_hdmi_display", None) if getattr(args, "record_hdmi_display", None) is not None else getattr(args, "hdmi_display", 0) or 0),
+        "record_resolution": getattr(args, "record_hdmi_resolution", None) or getattr(args, "hdmi_resolution", "1920x1080") or "1920x1080",
+        "record_fps": int(getattr(args, "record_hdmi_fps", None) if getattr(args, "record_hdmi_fps", None) is not None else getattr(args, "hdmi_fps", 30) or 30),
+        "record_sources": _record_src[:4],
     }
 
 
@@ -14432,6 +14918,7 @@ def _has_effective_cli_args(argv):
         "--webui",
         "--subtitle-overlay",
         "--hdmi-output",
+        "--record-hdmi",
     }
     ignored_with_value = {
         "--hdmi-layout",
@@ -14439,6 +14926,11 @@ def _has_effective_cli_args(argv):
         "--hdmi-resolution",
         "--hdmi-fps",
         "--hdmi-source",
+        "--record-hdmi-layout",
+        "--record-hdmi-display",
+        "--record-hdmi-resolution",
+        "--record-hdmi-fps",
+        "--record-hdmi-source",
     }
 
     i = 1
