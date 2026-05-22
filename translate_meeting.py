@@ -22,6 +22,7 @@ import threading
 import time
 import wave
 from collections import deque
+from difflib import SequenceMatcher
 
 IS_WINDOWS = sys.platform == "win32"
 IS_MACOS = sys.platform == "darwin"
@@ -4649,6 +4650,7 @@ def run_stream(capture_id: int, translator, model_name: str, model_path: str,
     _trans_pending = {}    # seq → (src_text, result, elapsed, asr_elapsed)
     _trans_next = [0]      # 下一個該顯示的序號
     _trans_lock = threading.Lock()
+    _recent_emitted_pairs = deque(maxlen=12)
 
     def _drain_translations(log_path):
         """按序號依序輸出所有已就緒的翻譯結果"""
@@ -4659,6 +4661,12 @@ def run_stream(capture_id: int, translator, model_name: str, model_path: str,
                     break
                 _trans_next[0] += 1
             src_text, result, elapsed, asr_elapsed = entry
+            src_text = (src_text or "").strip()
+            result = _sanitize_subtitle_text(result)
+            if _looks_like_meta_subtitle(result):
+                continue
+            if _is_duplicate_subtitle_pair(src_text, result, _recent_emitted_pairs):
+                continue
             if not result:
                 continue
             src_color, src_label, dst_color, dst_label = _MODE_LABELS[mode]
@@ -5032,6 +5040,7 @@ def run_stream_moonshine(capture_id: int, translator, moonshine_model_name: str,
     _trans_pending = {}
     _trans_next = [0]
     _trans_lock = threading.Lock()
+    _recent_emitted_pairs = deque(maxlen=12)
 
     def _drain_translations(log_path):
         """按序號依序輸出所有已就緒的翻譯結果"""
@@ -5042,6 +5051,12 @@ def run_stream_moonshine(capture_id: int, translator, moonshine_model_name: str,
                     break
                 _trans_next[0] += 1
             src_text, result, elapsed, asr_elapsed = entry
+            src_text = (src_text or "").strip()
+            result = _sanitize_subtitle_text(result)
+            if _looks_like_meta_subtitle(result):
+                continue
+            if _is_duplicate_subtitle_pair(src_text, result, _recent_emitted_pairs):
+                continue
             if not result:
                 continue
             src_color, src_label, dst_color, dst_label = _MODE_LABELS[mode]
@@ -5755,6 +5770,7 @@ def run_stream_remote(capture_id: int, translator, model_name: str,
     _trans_pending = {}
     _trans_next = [0]
     _trans_lock = threading.Lock()
+    _recent_emitted_pairs = deque(maxlen=12)
 
     def _drain_translations(_log_path):
         """按序號依序輸出所有已就緒的翻譯結果"""
@@ -5765,6 +5781,12 @@ def run_stream_remote(capture_id: int, translator, model_name: str,
                     break
                 _trans_next[0] += 1
             src_text, result, elapsed, asr_elapsed = entry
+            src_text = (src_text or "").strip()
+            result = _sanitize_subtitle_text(result)
+            if _looks_like_meta_subtitle(result):
+                continue
+            if _is_duplicate_subtitle_pair(src_text, result, _recent_emitted_pairs):
+                continue
             if not result:
                 continue
             src_color, src_label, dst_color, dst_label = _MODE_LABELS[mode]
@@ -6486,6 +6508,7 @@ def run_stream_local_whisper(capture_id: int, translator, model_name: str,
     _trans_pending = {}
     _trans_next = [0]
     _trans_lock = threading.Lock()
+    _recent_emitted_pairs = deque(maxlen=12)
 
     def _drain_translations(_log_path):
         while True:
@@ -6495,6 +6518,12 @@ def run_stream_local_whisper(capture_id: int, translator, model_name: str,
                     break
                 _trans_next[0] += 1
             src_text, result, elapsed, asr_elapsed = entry
+            src_text = (src_text or "").strip()
+            result = _sanitize_subtitle_text(result)
+            if _looks_like_meta_subtitle(result):
+                continue
+            if _is_duplicate_subtitle_pair(src_text, result, _recent_emitted_pairs):
+                continue
             if not result:
                 continue
             src_color, src_label, dst_color, dst_label = _MODE_LABELS[mode]
@@ -7691,6 +7720,7 @@ def run_stream_bidirectional(lb_device_id, mic_device_id,
     _trans_pending_mic = {}
     _trans_next_mic = [0]
     _trans_lock_mic = threading.Lock()
+    emitted_pairs = {"loopback": deque(maxlen=12), "mic": deque(maxlen=12)}
 
     _NO_TRANSLATE = object()  # 哨兵值：不翻譯，只轉錄
 
@@ -7716,9 +7746,12 @@ def run_stream_bidirectional(lb_device_id, mic_device_id,
                     break
                 next_seq[0] += 1
             src_text, result, elapsed, asr_elapsed = entry
+            src_text = (src_text or "").strip()
             if result is _NO_TRANSLATE:
                 # 不翻譯模式：只印原文一行
                 if not src_text:
+                    continue
+                if _is_duplicate_subtitle_pair(src_text, "", emitted_pairs[source]):
                     continue
                 with print_lock:
                     _print_with_badge(f"{prefix_src}{src_color}[{src_label}] {src_text}{RESET}",
@@ -7740,6 +7773,11 @@ def run_stream_bidirectional(lb_device_id, mic_device_id,
                 _webui_send({"type": "transcription", "source": source,
                              "src_lang": src_label, "src_text": src_text,
                              "asr_time": round(asr_elapsed, 1), "timestamp": timestamp})
+                continue
+            result = _sanitize_subtitle_text(result)
+            if _looks_like_meta_subtitle(result):
+                continue
+            if _is_duplicate_subtitle_pair(src_text, result, emitted_pairs[source]):
                 continue
             if not result:
                 continue
@@ -10985,6 +11023,55 @@ def _append_realtime_segment(segments_data, lines, end_sec, duration_hint=0.0,
     if not cleaned_lines:
         return
 
+    def _find_overlap_start(prev_text, curr_text):
+        prev_text = (prev_text or "").strip()
+        curr_text = (curr_text or "").strip()
+        if not prev_text or not curr_text:
+            return None
+        max_prefix = min(len(curr_text), len(prev_text))
+        for overlap_len in range(max_prefix, 3, -1):
+            prefix = curr_text[:overlap_len]
+            start = prev_text.rfind(prefix)
+            if start < 0:
+                continue
+            if start < max(0, len(prev_text) // 3):
+                continue
+            return start
+        return None
+
+    def _merge_line_text(prev_text, curr_text):
+        prev_text = (prev_text or "").strip()
+        curr_text = (curr_text or "").strip()
+        if not prev_text:
+            return curr_text
+        if not curr_text:
+            return prev_text
+        if prev_text == curr_text:
+            return prev_text
+        overlap_start = _find_overlap_start(prev_text, curr_text)
+        if overlap_start is None:
+            return None
+        merged = (prev_text[:overlap_start] + curr_text).strip()
+        if len(merged) <= max(len(prev_text), len(curr_text)):
+            return None
+        return merged
+
+    def _merge_lines(prev_lines, curr_lines):
+        if len(prev_lines) != len(curr_lines):
+            return None
+        merged = []
+        changed = False
+        for prev_line, curr_line in zip(prev_lines, curr_lines):
+            if prev_line.get("label", "") != curr_line.get("label", ""):
+                return None
+            merged_text = _merge_line_text(prev_line.get("text", ""), curr_line.get("text", ""))
+            if merged_text is None:
+                return None
+            if merged_text != prev_line.get("text", ""):
+                changed = True
+            merged.append({"label": prev_line.get("label", ""), "text": merged_text})
+        return merged if changed else None
+
     if segments_data and segments_data[-1].get("lines") == cleaned_lines:
         return
 
@@ -11004,6 +11091,11 @@ def _append_realtime_segment(segments_data, lines, end_sec, duration_hint=0.0,
 
     if segments_data:
         prev_end = max(float(segments_data[-1].get("end", 0.0) or 0.0), 0.0)
+        merged_lines = _merge_lines(segments_data[-1].get("lines", []), cleaned_lines)
+        if merged_lines is not None:
+            segments_data[-1]["lines"] = merged_lines
+            segments_data[-1]["end"] = round(max(end_sec, prev_end), 3)
+            return
         if start_sec < prev_end:
             start_sec = prev_end
         if end_sec <= start_sec:
@@ -11826,6 +11918,79 @@ def _is_ja_hallucination(text):
         "字幕提供", "字幕制作", "翻訳者",
         "Amara", "amara",
     ))
+
+
+def _normalize_subtitle_text(text):
+    text = re.sub(r"<[^>]+>", " ", (text or ""))
+    text = text.replace("：", ":")
+    return re.sub(r"\s+", " ", text).strip().lower()
+
+
+def _sanitize_subtitle_text(text):
+    cleaned = (text or "").strip()
+    if not cleaned:
+        return ""
+    patterns = [
+        r"(?is)<think>[\s\S]*?(?:</think>|$)",
+        r"(?is)\bInstruction\s*:.*$",
+        r"(?is)\bRecent context\s*:.*$",
+        r"(?is)\bMeeting topic\s*:.*$",
+        r"(?is)\bTranslate\s*:.*$",
+        r"(?is)最近的對話上下文[：:].*$",
+        r"(?is)本次會議主題[：:].*$",
+        r"(?is)会議のテーマ[：:].*$",
+        r"(?is)翻譯如下[：:].*$",
+        r"(?is)以下是翻譯[：:].*$",
+        r"(?is)根據格式要求.*$",
+        r"(?is)最終版本[：:].*$",
+        r"(?is)最終定稿[：:].*$",
+        r"(?is)再確認指令後.*$",
+        r"(?is)再依指示修正後.*$",
+        r"(?is)直接輸出翻譯結果.*$",
+        r"(?is)不要使用\s*<think>.*$",
+        r"(?is)Output only ONE line.*$",
+        r"(?is)do not use <think>.*$",
+    ]
+    for pattern in patterns:
+        cleaned = re.sub(pattern, "", cleaned).strip()
+    return cleaned.splitlines()[0].strip() if cleaned else ""
+
+
+def _looks_like_meta_subtitle(text):
+    low = _normalize_subtitle_text(text)
+    if not low:
+        return True
+    meta_markers = (
+        "instruction:", "recent context", "meeting topic", "translate:",
+        "output only one line", "do not use <think>",
+        "最近的對話上下文", "本次會議主題", "会議のテーマ",
+        "翻譯如下", "以下是翻譯", "直接輸出翻譯結果",
+        "忠實翻譯原文", "字幕提供", "字幕制作", "字幕製作",
+        "translated by", "subtitles by", "captions by", "amara.org",
+    )
+    return any(marker in low for marker in meta_markers)
+
+
+def _is_duplicate_subtitle_pair(src_text, dst_text, recent_pairs):
+    src_norm = _normalize_subtitle_text(src_text)
+    dst_norm = _normalize_subtitle_text(dst_text)
+    if not src_norm and not dst_norm:
+        return True
+    pair_norm = f"{src_norm} || {dst_norm}" if dst_norm else src_norm
+    for prev_src, prev_dst, prev_pair in recent_pairs:
+        if pair_norm == prev_pair:
+            return True
+        if dst_norm and prev_dst and dst_norm == prev_dst:
+            if not src_norm or not prev_src or SequenceMatcher(None, src_norm, prev_src).ratio() > 0.88:
+                return True
+        if src_norm and prev_src and src_norm == prev_src and dst_norm and prev_dst:
+            if SequenceMatcher(None, dst_norm, prev_dst).ratio() > 0.88:
+                return True
+        shorter = min(len(pair_norm), len(prev_pair))
+        if shorter >= 12 and SequenceMatcher(None, pair_norm, prev_pair).ratio() > 0.92:
+            return True
+    recent_pairs.append((src_norm, dst_norm, pair_norm))
+    return False
 
 
 def _ffprobe_info(input_path):
