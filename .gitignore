@@ -15,6 +15,7 @@ pyvenv.cfg
 # Runtime/temp files
 .webui_pause_cmd
 *.log
+config.json
 
 # Local outputs
 logs/

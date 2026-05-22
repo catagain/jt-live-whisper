@@ -860,6 +860,36 @@ def _clear_webui_pause_cmd_file():
         pass
 
 
+def _start_capture_components(*components):
+    """Start capture-related components in parallel to reduce A/V skew."""
+    active = [(label, component) for label, component in components if component is not None]
+    if not active:
+        return
+
+    errors = []
+    errors_lock = threading.Lock()
+
+    def _start_one(label, component):
+        try:
+            component.start()
+        except Exception as e:
+            with errors_lock:
+                errors.append((label, e))
+
+    threads = []
+    for label, component in active:
+        t = threading.Thread(target=_start_one, args=(label, component), daemon=True)
+        t.start()
+        threads.append(t)
+
+    for t in threads:
+        t.join()
+
+    if errors:
+        detail = "; ".join(f"{label}: {err}" for label, err in errors)
+        raise RuntimeError(f"同步啟動錄製元件失敗: {detail}")
+
+
 def _consume_webui_pause_cmd():
     try:
         with open(_WEBUI_PAUSE_CMD_FILE, "r", encoding="utf-8") as f:
@@ -4155,6 +4185,7 @@ def run_stream(capture_id: int, translator, model_name: str, model_path: str,
         "--length", str(length_ms),
         "--keep", "200",
         "--vad-thold", "0.8",
+        "--start-paused",
     ]
 
     # 翻譯記錄檔（以時間命名）
@@ -4177,6 +4208,9 @@ def run_stream(capture_id: int, translator, model_name: str, model_path: str,
     _mixer = None            # Windows 混合錄音的 mixer
     hdmi_output = None
     aux_video_recorders = []
+    recording_start_event = threading.Event()
+    recording_start_time_ref = [None]
+    recording_start_time_ref = [None]
     if record_video:
         try:
             video_recorder = _VideoRecorder(topic=meeting_topic, camera_name=video_device, output_dir=session_output_dir)
@@ -4184,6 +4218,9 @@ def run_stream(capture_id: int, translator, model_name: str, model_path: str,
         except Exception as e:
             print(f"{C_HIGHLIGHT}[警告] 無法啟動影片錄製: {e}{RESET}")
             video_recorder = None
+    if video_recorder is None:
+        recording_start_time_ref[0] = time.monotonic()
+        recording_start_event.set()
     hdmi_managed_in_main = bool(hdmi_output_config and hdmi_output_config.get("managed_in_main"))
     if hdmi_output_config and hdmi_output_config.get("enabled") and not hdmi_managed_in_main:
         try:
@@ -4254,7 +4291,9 @@ def run_stream(capture_id: int, translator, model_name: str, model_path: str,
         if IS_WINDOWS and rec_dev_id == WASAPI_MIXED_ID:
             # Windows 混合錄音（Loopback + 麥克風）
             _stop_ev = threading.Event()
-            _mixed = _setup_mixed_recording(_stop_ev, meeting_topic)
+            _mixed = _setup_mixed_recording(_stop_ev, meeting_topic,
+                                            start_event=recording_start_event,
+                                            start_time_ref=recording_start_time_ref)
             if _mixed:
                 recorder, _mixer, rec_stream, _rec_stream_mic = _mixed
             else:
@@ -4263,7 +4302,9 @@ def run_stream(capture_id: int, translator, model_name: str, model_path: str,
             wb_info = _find_wasapi_loopback()
             rec_sr = int(wb_info["defaultSampleRate"])
             rec_ch = wb_info["maxInputChannels"]
-            recorder = _AudioRecorder(rec_sr, rec_ch, topic=meeting_topic, mode=mode)
+            recorder = _AudioRecorder(rec_sr, rec_ch, topic=meeting_topic, mode=mode,
+                                      start_event=recording_start_event,
+                                      start_time_ref=recording_start_time_ref)
 
             def rec_callback(indata, frames, time_info, status):
                 if _is_recording_paused():
@@ -4285,7 +4326,9 @@ def run_stream(capture_id: int, translator, model_name: str, model_path: str,
             dev_info = sd.query_devices(rec_dev_id)
             rec_sr = int(dev_info["default_samplerate"])
             rec_ch = max(dev_info["max_input_channels"], 1)
-            recorder = _AudioRecorder(rec_sr, rec_ch, topic=meeting_topic, mode=mode)
+            recorder = _AudioRecorder(rec_sr, rec_ch, topic=meeting_topic, mode=mode,
+                                      start_event=recording_start_event,
+                                      start_time_ref=recording_start_time_ref)
 
             def rec_callback(indata, frames, time_info, status):
                 if _is_recording_paused():
@@ -4339,22 +4382,11 @@ def run_stream(capture_id: int, translator, model_name: str, model_path: str,
 
     proc = subprocess.Popen(
         cmd,
+        stdin=subprocess.PIPE,
         stdout=subprocess.DEVNULL,
         stderr=subprocess.PIPE,
         **_SUBPROCESS_FLAGS,
     )
-
-    # 啟動錄影與錄音串流（盡量同時，確保影音同步）
-    if video_recorder:
-        video_recorder.start()
-    for rec in aux_video_recorders:
-        rec.start()
-    if hdmi_output:
-        hdmi_output.start()
-    if rec_stream:
-        rec_stream.start()
-    if _rec_stream_mic:
-        _rec_stream_mic.start()
 
     stop_keypress = threading.Event()
     pause_event = threading.Event()
@@ -4478,27 +4510,110 @@ def run_stream(capture_id: int, translator, model_name: str, model_path: str,
     # 等待模型載入完成
     print(f"{C_DIM}正在載入 whisper 模型（首次可能需要幾秒）...{RESET}", flush=True)
     _webui_send({"type": "progress", "stage": "載入中", "detail": "whisper 模型"})
+    _whisper_ready = threading.Event()
+    _whisper_stderr_errors = deque(maxlen=8)
 
     # 用一個非阻塞方式讀 stderr
     def read_stderr():
         for line in proc.stderr:
             line = line.decode("utf-8", errors="replace").strip()
             if line:
+                lower = line.lower()
+                if line == "JT_WHISPER_MODEL_READY" or "processing " in lower or "using vad" in lower or "n_new_line =" in lower:
+                    _whisper_ready.set()
                 # 只顯示重要的 stderr 訊息
-                if "failed" in line.lower() or "error" in line.lower():
+                if "failed" in lower or "error" in lower:
+                    _whisper_stderr_errors.append(line)
                     print(f"[whisper] {line}", file=sys.stderr)
+        _whisper_ready.set()
 
     stderr_thread = threading.Thread(target=read_stderr, daemon=True)
     stderr_thread.start()
 
-    # 等待 whisper-stream 開始輸出
-    time.sleep(2)
+    if video_recorder:
+        try:
+            video_recorder.prepare()
+        except Exception as e:
+            print(f"{C_HIGHLIGHT}[警告] 無法預熱影片錄製: {e}{RESET}", flush=True)
+            try:
+                video_recorder.stop()
+            except Exception:
+                pass
+            video_recorder = None
+            recording_start_event.set()
+
+    # 等待 whisper-stream 完成模型初始化，再同步開始錄影/錄音
+    if not _whisper_ready.wait(timeout=120):
+        print(f"[錯誤] 等待 whisper-stream 載入模型逾時", file=sys.stderr)
+        if os.path.exists(output_file):
+            os.remove(output_file)
+        try:
+            proc.terminate()
+        except Exception:
+            pass
+        sys.exit(1)
 
     if proc.poll() is not None:
         print(f"[錯誤] whisper-stream 意外退出 (code={proc.returncode})", file=sys.stderr)
+        if _whisper_stderr_errors:
+            print(f"[whisper] {' | '.join(_whisper_stderr_errors)}", file=sys.stderr)
         if os.path.exists(output_file):
             os.remove(output_file)
         sys.exit(1)
+
+    initial_output_size = 0
+    try:
+        _webui_send({"type": "progress", "stage": "", "detail": ""})
+        if sys.stdout.isatty():
+            clear_status_bar()
+            sys.stdout.write("\x1b[2J\x1b[H")
+            sys.stdout.flush()
+        if video_recorder:
+            video_recorder.begin_recording()
+        _start_capture_components(
+            *((f"aux_video_recorder_{idx}", rec) for idx, rec in enumerate(aux_video_recorders)),
+            ("hdmi_output", hdmi_output),
+            ("rec_stream", rec_stream),
+            ("rec_stream_mic", _rec_stream_mic),
+        )
+        if proc.stdin:
+            try:
+                proc.stdin.write(b"\n")
+            except TypeError:
+                proc.stdin.write("\n")
+            proc.stdin.flush()
+        recording_start_time_ref[0] = time.monotonic()
+        recording_start_event.set()
+        try:
+            initial_output_size = os.path.getsize(output_file)
+        except OSError:
+            initial_output_size = 0
+    except Exception as e:
+        print(f"{C_HIGHLIGHT}[警告] 無法同步啟動錄製元件: {e}{RESET}", flush=True)
+        if recorder:
+            try:
+                recorder.close()
+            except Exception:
+                pass
+            recorder = None
+        if video_recorder:
+            try:
+                video_recorder.stop()
+            except Exception:
+                pass
+            video_recorder = None
+        for rec in aux_video_recorders:
+            try:
+                rec.stop()
+            except Exception:
+                pass
+        aux_video_recorders = []
+        if hdmi_output:
+            try:
+                hdmi_output.stop()
+            except Exception:
+                pass
+            hdmi_output = None
 
     listen_hints = {
         "en2zh": "說英文即可看到翻譯",
@@ -4591,7 +4706,7 @@ def run_stream(capture_id: int, translator, model_name: str, model_path: str,
         _drain_translations(log_path)
 
     # 持續讀取輸出檔案的新內容
-    last_size = 0
+    last_size = initial_output_size
     last_translated = ""
     buffer = ""
     _loop_tick = 0
@@ -5090,6 +5205,8 @@ def run_stream_moonshine(capture_id: int, translator, moonshine_model_name: str,
         sd_samplerate = int(dev_info["default_samplerate"])
         sd_channels = min(dev_info["max_input_channels"], 2)
 
+    recording_start_event = threading.Event()
+
     # 建立錄音
     rec_stream = None
     _rec_stream_mic = None   # Windows 混合錄音的麥克風串流
@@ -5100,7 +5217,8 @@ def run_stream_moonshine(capture_id: int, translator, moonshine_model_name: str,
         if use_separate_rec:
             if IS_WINDOWS and rec_device == WASAPI_MIXED_ID:
                 # Windows 混合錄音（Loopback + 麥克風）
-                _mixed = _setup_mixed_recording(stop_event, meeting_topic)
+                _mixed = _setup_mixed_recording(stop_event, meeting_topic, start_event=recording_start_event,
+                                                start_time_ref=recording_start_time_ref)
                 if _mixed:
                     recorder, _mixer, rec_stream, _rec_stream_mic = _mixed
                 else:
@@ -5110,7 +5228,9 @@ def run_stream_moonshine(capture_id: int, translator, moonshine_model_name: str,
                 wb_rec = _find_wasapi_loopback()
                 rec_sr = int(wb_rec["defaultSampleRate"])
                 rec_ch = wb_rec["maxInputChannels"]
-                recorder = _AudioRecorder(rec_sr, rec_ch, topic=meeting_topic, mode=mode)
+                recorder = _AudioRecorder(rec_sr, rec_ch, topic=meeting_topic, mode=mode,
+                                          start_event=recording_start_event,
+                                          start_time_ref=recording_start_time_ref)
 
                 def rec_callback(indata, frames, time_info, status):
                     if not stop_event.is_set() and not _is_recording_paused():
@@ -5132,7 +5252,9 @@ def run_stream_moonshine(capture_id: int, translator, moonshine_model_name: str,
                 rec_info = sd.query_devices(rec_device)
                 rec_sr = int(rec_info["default_samplerate"])
                 rec_ch = max(rec_info["max_input_channels"], 1)
-                recorder = _AudioRecorder(rec_sr, rec_ch, topic=meeting_topic, mode=mode)
+                recorder = _AudioRecorder(rec_sr, rec_ch, topic=meeting_topic, mode=mode,
+                                          start_event=recording_start_event,
+                                          start_time_ref=recording_start_time_ref)
 
                 def rec_callback(indata, frames, time_info, status):
                     if not stop_event.is_set() and not _is_recording_paused():
@@ -5152,7 +5274,9 @@ def run_stream_moonshine(capture_id: int, translator, moonshine_model_name: str,
                     use_separate_rec = False
         else:
             # 錄音裝置與 ASR 同一個，在 audio_callback 裡寫入
-            recorder = _AudioRecorder(sd_samplerate, topic=meeting_topic, mode=mode)
+            recorder = _AudioRecorder(sd_samplerate, topic=meeting_topic, mode=mode,
+                                      start_event=recording_start_event,
+                                      start_time_ref=recording_start_time_ref)
         if recorder:
             print(f"  {C_DIM}錄音: {recorder.path}{RESET}")
 
@@ -5167,6 +5291,8 @@ def run_stream_moonshine(capture_id: int, translator, moonshine_model_name: str,
             audio = audio.flatten()
         _push_rms(float(np.sqrt(np.mean(audio ** 2))))
         if _is_recording_paused():
+            return
+        if not recording_start_event.is_set():
             return
         if recorder and rec_stream is None:
             # 同裝置錄音：寫入 mono
@@ -5254,13 +5380,14 @@ def run_stream_moonshine(capture_id: int, translator, moonshine_model_name: str,
     signal.signal(signal.SIGTERM, signal_handler)
 
     # 啟動錄影與音訊串流（盡量同時，確保影音同步）
-    if video_recorder:
-        video_recorder.start()
-    sd_stream.start()
-    if rec_stream:
-        rec_stream.start()
-    if _rec_stream_mic:
-        _rec_stream_mic.start()
+    _start_capture_components(
+        ("video_recorder", video_recorder),
+        ("sd_stream", sd_stream),
+        ("rec_stream", rec_stream),
+        ("rec_stream_mic", _rec_stream_mic),
+    )
+    recording_start_time_ref[0] = time.monotonic()
+    recording_start_event.set()
 
     listen_hints = {
         "en2zh": "說英文即可看到翻譯",
@@ -5403,6 +5530,8 @@ def run_stream_remote(capture_id: int, translator, model_name: str,
     _mixer = None            # Windows 混合錄音的 mixer
     video_recorder = None
     hdmi_output = None
+    recording_start_event = threading.Event()
+    recording_start_time_ref = [None]
     if record_video:
         try:
             video_recorder = _VideoRecorder(topic=meeting_topic, camera_name=video_device)
@@ -5410,6 +5539,9 @@ def run_stream_remote(capture_id: int, translator, model_name: str,
         except Exception as e:
             print(f"{C_HIGHLIGHT}[警告] 無法啟動影片錄製: {e}{RESET}")
             video_recorder = None
+    if video_recorder is None:
+        recording_start_time_ref[0] = time.monotonic()
+        recording_start_event.set()
     hdmi_managed_in_main = bool(hdmi_output_config and hdmi_output_config.get("managed_in_main"))
     if hdmi_output_config and hdmi_output_config.get("enabled") and not hdmi_managed_in_main:
         try:
@@ -5429,7 +5561,8 @@ def run_stream_remote(capture_id: int, translator, model_name: str,
         if use_separate_rec:
             if IS_WINDOWS and rec_device == WASAPI_MIXED_ID:
                 # Windows 混合錄音（Loopback + 麥克風）
-                _mixed = _setup_mixed_recording(stop_event, meeting_topic)
+                _mixed = _setup_mixed_recording(stop_event, meeting_topic, start_event=recording_start_event,
+                                                start_time_ref=recording_start_time_ref)
                 if _mixed:
                     recorder, _mixer, rec_stream, _rec_stream_mic = _mixed
                 else:
@@ -5439,7 +5572,9 @@ def run_stream_remote(capture_id: int, translator, model_name: str,
                 wb_rec = _find_wasapi_loopback()
                 rec_sr = int(wb_rec["defaultSampleRate"])
                 rec_ch = wb_rec["maxInputChannels"]
-                recorder = _AudioRecorder(rec_sr, rec_ch, topic=meeting_topic, mode=mode)
+                recorder = _AudioRecorder(rec_sr, rec_ch, topic=meeting_topic, mode=mode,
+                                          start_event=recording_start_event,
+                                          start_time_ref=recording_start_time_ref)
 
                 def rec_callback(indata, frames, time_info, status):
                     if not stop_event.is_set() and not _is_recording_paused():
@@ -5460,7 +5595,9 @@ def run_stream_remote(capture_id: int, translator, model_name: str,
                 rec_info = sd.query_devices(rec_device)
                 rec_sr = int(rec_info["default_samplerate"])
                 rec_ch = max(rec_info["max_input_channels"], 1)
-                recorder = _AudioRecorder(rec_sr, rec_ch, topic=meeting_topic, mode=mode)
+                recorder = _AudioRecorder(rec_sr, rec_ch, topic=meeting_topic, mode=mode,
+                                          start_event=recording_start_event,
+                                          start_time_ref=recording_start_time_ref)
 
                 def rec_callback(indata, frames, time_info, status):
                     if not stop_event.is_set() and not _is_recording_paused():
@@ -5478,7 +5615,9 @@ def run_stream_remote(capture_id: int, translator, model_name: str,
                     rec_stream = None
                     use_separate_rec = False
         else:
-            recorder = _AudioRecorder(sd_samplerate, topic=meeting_topic, mode=mode)
+            recorder = _AudioRecorder(sd_samplerate, topic=meeting_topic, mode=mode,
+                                      start_event=recording_start_event,
+                                      start_time_ref=recording_start_time_ref)
 
     # ── Banner ──
     print(f"{C_TITLE}{'=' * 60}{RESET}")
@@ -5543,6 +5682,8 @@ def run_stream_remote(capture_id: int, translator, model_name: str,
         # RMS
         _push_rms(float(np.sqrt(np.mean(audio ** 2))))
         if _is_recording_paused():
+            return
+        if not recording_start_event.is_set():
             return
         # 同裝置錄音
         if recorder and rec_stream is None:
@@ -5872,17 +6013,16 @@ def run_stream_remote(capture_id: int, translator, model_name: str,
     signal.signal(signal.SIGTERM, signal_handler)
 
     # ── 啟動錄影與音訊串流（盡量同時，確保影音同步）──
-    if video_recorder:
-        video_recorder.start()
-    for rec in aux_video_recorders:  # Start auxiliary video recorders
-        rec.start()
-    if hdmi_output:
-        hdmi_output.start()
-    sd_stream.start()
-    if rec_stream:
-        rec_stream.start()
-    if _rec_stream_mic:
-        _rec_stream_mic.start()
+    _start_capture_components(
+        ("video_recorder", video_recorder),
+        *((f"aux_video_recorder_{idx}", rec) for idx, rec in enumerate(aux_video_recorders)),
+        ("hdmi_output", hdmi_output),
+        ("sd_stream", sd_stream),
+        ("rec_stream", rec_stream),
+        ("rec_stream_mic", _rec_stream_mic),
+    )
+    recording_start_time_ref[0] = time.monotonic()
+    recording_start_event.set()
 
     listen_hints = {
         "en2zh": "說英文即可看到翻譯",
@@ -6107,6 +6247,8 @@ def run_stream_local_whisper(capture_id: int, translator, model_name: str,
     _mixer = None            # Windows 混合錄音的 mixer
     video_recorder = None
     hdmi_output = None
+    recording_start_event = threading.Event()
+    recording_start_time_ref = [None]
     if record_video:
         try:
             video_recorder = _VideoRecorder(topic=meeting_topic, camera_name=video_device)
@@ -6114,6 +6256,9 @@ def run_stream_local_whisper(capture_id: int, translator, model_name: str,
         except Exception as e:
             print(f"{C_HIGHLIGHT}[警告] 無法啟動影片錄製: {e}{RESET}")
             video_recorder = None
+    if video_recorder is None:
+        recording_start_time_ref[0] = time.monotonic()
+        recording_start_event.set()
     hdmi_managed_in_main = bool(hdmi_output_config and hdmi_output_config.get("managed_in_main"))
     if hdmi_output_config and hdmi_output_config.get("enabled") and not hdmi_managed_in_main:
         try:
@@ -6133,7 +6278,8 @@ def run_stream_local_whisper(capture_id: int, translator, model_name: str,
         if use_separate_rec:
             if IS_WINDOWS and rec_device == WASAPI_MIXED_ID:
                 # Windows 混合錄音（Loopback + 麥克風）
-                _mixed = _setup_mixed_recording(stop_event, meeting_topic)
+                _mixed = _setup_mixed_recording(stop_event, meeting_topic, start_event=recording_start_event,
+                                                start_time_ref=recording_start_time_ref)
                 if _mixed:
                     recorder, _mixer, rec_stream, _rec_stream_mic = _mixed
                 else:
@@ -6143,7 +6289,9 @@ def run_stream_local_whisper(capture_id: int, translator, model_name: str,
                 wb_rec = _find_wasapi_loopback()
                 rec_sr = int(wb_rec["defaultSampleRate"])
                 rec_ch = wb_rec["maxInputChannels"]
-                recorder = _AudioRecorder(rec_sr, rec_ch, topic=meeting_topic, mode=mode)
+                recorder = _AudioRecorder(rec_sr, rec_ch, topic=meeting_topic, mode=mode,
+                                          start_event=recording_start_event,
+                                          start_time_ref=recording_start_time_ref)
 
                 def rec_callback(indata, frames, time_info, status):
                     if not stop_event.is_set() and not _is_recording_paused():
@@ -6165,7 +6313,9 @@ def run_stream_local_whisper(capture_id: int, translator, model_name: str,
                 rec_info = sd.query_devices(rec_device)
                 rec_sr = int(rec_info["default_samplerate"])
                 rec_ch = max(rec_info["max_input_channels"], 1)
-                recorder = _AudioRecorder(rec_sr, rec_ch, topic=meeting_topic, mode=mode)
+                recorder = _AudioRecorder(rec_sr, rec_ch, topic=meeting_topic, mode=mode,
+                                          start_event=recording_start_event,
+                                          start_time_ref=recording_start_time_ref)
 
                 def rec_callback(indata, frames, time_info, status):
                     if not stop_event.is_set() and not _is_recording_paused():
@@ -6183,7 +6333,9 @@ def run_stream_local_whisper(capture_id: int, translator, model_name: str,
                     rec_stream = None
                     use_separate_rec = False
         else:
-            recorder = _AudioRecorder(sd_samplerate, topic=meeting_topic, mode=mode)
+            recorder = _AudioRecorder(sd_samplerate, topic=meeting_topic, mode=mode,
+                                      start_event=recording_start_event,
+                                      start_time_ref=recording_start_time_ref)
 
     # ── Banner ──
     print(f"{C_TITLE}{'=' * 60}{RESET}")
@@ -6246,6 +6398,8 @@ def run_stream_local_whisper(capture_id: int, translator, model_name: str,
             audio = audio.flatten()
         _push_rms(float(np.sqrt(np.mean(audio ** 2))))
         if _is_recording_paused():
+            return
+        if not recording_start_event.is_set():
             return
         if recorder and rec_stream is None:
             recorder.write(audio)
@@ -6583,16 +6737,15 @@ def run_stream_local_whisper(capture_id: int, translator, model_name: str,
     signal.signal(signal.SIGTERM, signal_handler)
 
     # ── 啟動錄影與音訊串流（盡量同時，確保影音同步）──
-    if video_recorder:
-        video_recorder.start()
-    if hdmi_output:
-        hdmi_output.start()
-    sd_stream.start()
-    if rec_stream:
-        rec_stream.start()
-    if _rec_stream_mic:
-        _rec_stream_mic.start()
-
+    _start_capture_components(
+        ("video_recorder", video_recorder),
+        ("hdmi_output", hdmi_output),
+        ("sd_stream", sd_stream),
+        ("rec_stream", rec_stream),
+        ("rec_stream_mic", _rec_stream_mic),
+    )
+    recording_start_time_ref[0] = time.monotonic()
+    recording_start_event.set()
     # ── 驗證音訊是否正常流入 ──
     _audio_verified = False
     for _chk in range(6):  # 最多等 3 秒
@@ -6995,6 +7148,12 @@ def run_stream_bidirectional(lb_device_id, mic_device_id,
     video_recorder = None
     hdmi_output = None
     aux_video_recorders = []
+    recording_start_event = threading.Event()
+    recording_start_time_ref = [None]
+    source_ready_event = threading.Event()
+    source_ready_threshold = 0.0045
+    source_ready_blocks_needed = 8
+    source_ready_active_blocks = [0]
     if record_video:
         try:
             video_recorder = _VideoRecorder(topic=meeting_topic, camera_name=video_device, output_dir=session_output_dir)
@@ -7002,6 +7161,9 @@ def run_stream_bidirectional(lb_device_id, mic_device_id,
         except Exception as e:
             print(f"{C_HIGHLIGHT}[警告] 無法啟動影片錄製: {e}{RESET}")
             video_recorder = None
+    if video_recorder is None:
+        recording_start_time_ref[0] = time.monotonic()
+        recording_start_event.set()
     hdmi_managed_in_main = bool(hdmi_output_config and hdmi_output_config.get("managed_in_main"))
     if hdmi_output_config and hdmi_output_config.get("enabled") and not hdmi_managed_in_main:
         try:
@@ -7048,8 +7210,12 @@ def run_stream_bidirectional(lb_device_id, mic_device_id,
             except Exception as e:
                 print(f"{C_HIGHLIGHT}[警告] 無法啟動來源 {idx} 影片錄製: {e}{RESET}")
     if record:
-        recorder_lb = _AudioRecorder(lb_sr, topic=f"{meeting_topic or ''}_系統音訊".lstrip("_"), mode=mode)
-        recorder_mic = _AudioRecorder(mic_sr, topic=f"{meeting_topic or ''}_麥克風".lstrip("_"), mode=mode)
+        recorder_lb = _AudioRecorder(lb_sr, topic=f"{meeting_topic or ''}_系統音訊".lstrip("_"), mode=mode,
+                         start_event=recording_start_event,
+                         start_time_ref=recording_start_time_ref)
+        recorder_mic = _AudioRecorder(mic_sr, topic=f"{meeting_topic or ''}_麥克風".lstrip("_"), mode=mode,
+                          start_event=recording_start_event,
+                          start_time_ref=recording_start_time_ref)
 
     # ── Banner ──
     print(f"{C_TITLE}{'=' * 60}{RESET}")
@@ -7150,8 +7316,18 @@ def run_stream_bidirectional(lb_device_id, mic_device_id,
             audio = audio.mean(axis=1)
         else:
             audio = audio.flatten()
-        _push_rms(float(np.sqrt(np.mean(audio ** 2))))
+        audio_rms = float(np.sqrt(np.mean(audio ** 2)))
+        _push_rms(audio_rms)
+        if not source_ready_event.is_set():
+            if audio_rms >= source_ready_threshold:
+                source_ready_active_blocks[0] += 1
+                if source_ready_active_blocks[0] >= source_ready_blocks_needed:
+                    source_ready_event.set()
+            else:
+                source_ready_active_blocks[0] = 0
         if _is_recording_paused():
+            return
+        if not recording_start_event.is_set():
             return
         if recorder_lb:
             recorder_lb.write(audio)
@@ -7180,6 +7356,8 @@ def run_stream_bidirectional(lb_device_id, mic_device_id,
             audio = audio.flatten()
         _push_rms(float(np.sqrt(np.mean(audio ** 2))))
         if _is_recording_paused():
+            return
+        if not recording_start_event.is_set():
             return
         if recorder_mic:
             recorder_mic.write(audio)
@@ -7891,16 +8069,38 @@ def run_stream_bidirectional(lb_device_id, mic_device_id,
     signal.signal(signal.SIGINT, signal_handler)
     signal.signal(signal.SIGTERM, signal_handler)
 
-    # ── 啟動錄影與音訊串流（盡量同時，確保影音同步）──
     if video_recorder:
-        video_recorder.start()
-    for rec in aux_video_recorders:
-        rec.start()
-    if hdmi_output:
-        hdmi_output.start()
-    lb_stream.start()
-    mic_stream.start()
+        video_recorder.prepare()
 
+    # ── 先啟動音訊/輔助輸出，主錄影等第一段有效系統音訊再正式起錄──
+    _start_capture_components(
+        *((f"aux_video_recorder_{idx}", rec) for idx, rec in enumerate(aux_video_recorders)),
+        ("hdmi_output", hdmi_output),
+        ("lb_stream", lb_stream),
+        ("mic_stream", mic_stream),
+    )
+
+    if video_recorder:
+        _source_ready = source_ready_event.wait(timeout=15)
+        _source_ready_ts = time.monotonic()
+        if not _source_ready:
+            print(f"  {C_WARN}[提示] 15 秒內未偵測到有效系統音訊，錄影改用逾時回退起錄{RESET}", flush=True)
+        video_recorder.begin_recording()
+        _video_ready_ts = video_recorder._last_ready_monotonic or time.monotonic()
+    else:
+        _source_ready_ts = None
+        _video_ready_ts = None
+    recording_start_time_ref[0] = time.monotonic()
+    recording_start_event.set()
+    if _source_ready_ts is not None and _video_ready_ts is not None:
+        _debug_progress(
+            "雙向起錄時間: "
+            f"source_ready={_source_ready_ts:.3f}, "
+            f"video_ready={_video_ready_ts:.3f}, "
+            f"recording_start={recording_start_time_ref[0]:.3f}, "
+            f"delta_sv={(_video_ready_ts - _source_ready_ts) * 1000:.1f}ms, "
+            f"delta_vs={(recording_start_time_ref[0] - _video_ready_ts) * 1000:.1f}ms"
+        )
     # ── 驗證音訊 ──
     _audio_ok = [False, False]  # [lb, mic]
     for _chk in range(6):
@@ -8278,7 +8478,8 @@ class _AudioRecorder:
     _MODE_FNAME = {"en2zh": "英翻中", "zh2en": "中翻英", "ja2zh": "日翻中", "zh2ja": "中翻日",
                    "en_zh": "英中雙向", "ja_zh": "日中雙向", "en": "英文", "zh": "中文", "ja": "日文"}
 
-    def __init__(self, samplerate=16000, channels=1, fmt=None, topic=None, mode=None):
+    def __init__(self, samplerate=16000, channels=1, fmt=None, topic=None, mode=None,
+                 start_event=None, start_time_ref=None):
         os.makedirs(RECORDING_DIR, exist_ok=True)
         from datetime import datetime
         mode_part = f"_{self._MODE_FNAME[mode]}" if mode and mode in self._MODE_FNAME else ""
@@ -8289,11 +8490,17 @@ class _AudioRecorder:
         self._channels = channels
         self._sampwidth = 2  # 16-bit
         self._target_fmt = fmt if fmt else RECORDING_FORMAT
+        self._start_event = start_event
+        self._start_time_ref = start_time_ref
+        self._leading_silence_written = False
         # 直接操作檔案，手動寫 WAV header 以便定期更新
         self._f = open(self.path, "wb")
         self._data_size = 0
         self._write_header()
         self._last_header_update = time.monotonic()
+
+    def _can_write(self):
+        return self._start_event is None or self._start_event.is_set()
 
     def _write_header(self):
         """寫入或更新 WAV header（seek 回檔頭覆寫）"""
@@ -8318,8 +8525,27 @@ class _AudioRecorder:
             self._f.flush()
             self._last_header_update = now
 
+    def _ensure_leading_silence(self, now=None):
+        if self._leading_silence_written:
+            return
+        self._leading_silence_written = True
+        if not self._start_time_ref or self._start_time_ref[0] is None:
+            return
+        now = time.monotonic() if now is None else now
+        lead_s = max(0.0, now - self._start_time_ref[0])
+        lead_frames = int(round(lead_s * self._samplerate))
+        if lead_frames <= 0:
+            return
+        raw = b"\x00\x00" * (lead_frames * self._channels)
+        self._f.write(raw)
+        self._data_size += len(raw)
+        self._maybe_update_header()
+
     def write(self, float32_mono):
         """寫入 float32 單聲道音訊（自動轉換為 int16）"""
+        if not self._can_write():
+            return
+        self._ensure_leading_silence()
         import numpy as np
         pcm = (float32_mono * 32767).clip(-32768, 32767).astype(np.int16)
         raw = pcm.tobytes()
@@ -8329,6 +8555,9 @@ class _AudioRecorder:
 
     def write_raw(self, float32_data):
         """寫入 float32 音訊（多聲道或單聲道皆可，自動轉 int16）"""
+        if not self._can_write():
+            return
+        self._ensure_leading_silence()
         import numpy as np
         data = float32_data.astype(np.float32)
         pcm = (data * 32767).clip(-32768, 32767).astype(np.int16)
@@ -8435,6 +8664,8 @@ class _AudioRecorder:
 
     def close(self):
         try:
+            if self._can_write():
+                self._ensure_leading_silence()
             self._write_header()
             self._f.close()
         except Exception:
@@ -8470,19 +8701,109 @@ class _VideoRecorder:
         self._ctrl_lock = threading.Lock()
         self._proc = None
         self._started = False
+        self._prepared = False
+        self._recording_active = False
+        self._startup_ready = threading.Event()
+        self._startup_stderr = deque(maxlen=8)
+        self._last_ready_monotonic = None
 
-    def start(self):
-        """明確啟動錄影（應在錄音串流啟動前立即呼叫，確保影音同步）。
-        在此之前錄影器不會被 pause/resume 影響，避免 Ctrl+P 在 setup 期間
-        造成 _paused 旗標與實際錄影狀態不一致。"""
+    def prepare(self):
+        """預熱 ffmpeg，但不保留預熱片段。"""
         with self._ctrl_lock:
-            if self._started:
+            if self._prepared:
                 return
             self._started = True
+            self._prepared = True
+            self._startup_ready.clear()
+            self._startup_stderr.clear()
+            self._last_ready_monotonic = None
             self._start_new_segment()
+        if not self._startup_ready.wait(timeout=20):
+            detail = " | ".join(self._startup_stderr)
+            self.stop()
+            if detail:
+                raise RuntimeError(f"ffmpeg 錄影啟動逾時：{detail}")
+            raise RuntimeError("ffmpeg 錄影啟動逾時")
+
+        # ffmpeg 首次啟動時可能已錄進預熱畫面；丟棄預熱片段後再開正式第一段。
+        with self._ctrl_lock:
+            self._stop_current_segment(keep_segment=False)
+            self._recording_active = False
+
+    def begin_recording(self):
+        """從預熱狀態開始正式錄影，正式片段從這一刻起算。"""
+        if not self._prepared:
+            self.prepare()
+        with self._ctrl_lock:
+            if self._recording_active:
+                return
+            self._startup_ready.clear()
+            self._startup_stderr.clear()
+            self._last_ready_monotonic = None
+            self._start_new_segment()
+        if not self._startup_ready.wait(timeout=20):
+            detail = " | ".join(self._startup_stderr)
+            self.stop()
+            if detail:
+                raise RuntimeError(f"ffmpeg 錄影正式起錄逾時：{detail}")
+            raise RuntimeError("ffmpeg 錄影正式起錄逾時")
+        with self._ctrl_lock:
+            self._recording_active = True
         # 只有在實際開始錄影後才注冊為活躍錄影器，
         # 避免 setup 期間的暫停事件破壞 segment 合併邏輯。
         _set_active_video_recorder(self)
+
+    def start(self):
+        """相容舊呼叫：預熱後立刻開始正式錄影。"""
+        self.prepare()
+        self.begin_recording()
+
+    def _monitor_ffmpeg_progress(self, proc, ready_event):
+        frame_rate = max(float(self._framerate or 15), 1.0)
+        min_ready_frames = 2
+        min_ready_time_us = int(1_000_000 / frame_rate)
+        try:
+            if proc.stdout is not None:
+                for line in proc.stdout:
+                    line = line.strip()
+                    if not line:
+                        continue
+                    if line.startswith("frame="):
+                        try:
+                            if int(line.split("=", 1)[1].strip()) >= min_ready_frames:
+                                if not ready_event.is_set():
+                                    self._last_ready_monotonic = time.monotonic()
+                                ready_event.set()
+                        except ValueError:
+                            pass
+                    elif line.startswith("out_time_us="):
+                        try:
+                            if int(line.split("=", 1)[1].strip()) >= min_ready_time_us:
+                                if not ready_event.is_set():
+                                    self._last_ready_monotonic = time.monotonic()
+                                ready_event.set()
+                        except ValueError:
+                            pass
+        finally:
+            try:
+                if proc.stdout is not None:
+                    proc.stdout.close()
+            except Exception:
+                pass
+
+    def _collect_ffmpeg_stderr(self, proc):
+        try:
+            if proc.stderr is not None:
+                for line in proc.stderr:
+                    line = line.strip()
+                    if line:
+                        self._startup_stderr.append(line)
+        finally:
+            try:
+                if proc.stderr is not None:
+                    proc.stderr.close()
+            except Exception:
+                pass
 
     def _detect_default_camera(self):
         if not IS_WINDOWS:
@@ -8530,15 +8851,24 @@ class _VideoRecorder:
 
         cmd += ["-c:v", "libx264", "-preset", "ultrafast", "-crf", "23",
                 "-pix_fmt", "yuv420p", "-r", str(self._framerate),
+                "-progress", "pipe:1", "-nostats",
                 out_path]
         try:
-            return subprocess.Popen(
+            proc = subprocess.Popen(
                 cmd,
                 stdin=subprocess.PIPE,
-                stdout=subprocess.DEVNULL,
-                stderr=subprocess.DEVNULL,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+                encoding="utf-8",
+                errors="replace",
                 **_SUBPROCESS_FLAGS,
             )
+            threading.Thread(target=self._monitor_ffmpeg_progress,
+                             args=(proc, self._startup_ready), daemon=True).start()
+            threading.Thread(target=self._collect_ffmpeg_stderr,
+                             args=(proc,), daemon=True).start()
+            return proc
         except Exception as e:
             raise RuntimeError(f"無法啟動 ffmpeg 錄影: {e}")
 
@@ -8546,7 +8876,7 @@ class _VideoRecorder:
         self._current_seg_path = self._next_seg_path()
         self._proc = self._start_ffmpeg(self._current_seg_path)
 
-    def _stop_current_segment(self):
+    def _stop_current_segment(self, keep_segment=True):
         if self._proc is None:
             return
         try:
@@ -8583,22 +8913,24 @@ class _VideoRecorder:
             self._proc = None
         if self._current_seg_path and os.path.exists(self._current_seg_path):
             try:
-                if os.path.getsize(self._current_seg_path) > 0:
+                if keep_segment and os.path.getsize(self._current_seg_path) > 0:
                     self._seg_paths.append(self._current_seg_path)
+                elif not keep_segment:
+                    os.remove(self._current_seg_path)
             except OSError:
                 pass
         self._current_seg_path = None
 
     def pause(self):
         with self._ctrl_lock:
-            if self._paused:
+            if self._paused or not self._recording_active:
                 return
             self._stop_current_segment()
             self._paused = True
 
     def resume(self):
         with self._ctrl_lock:
-            if not self._paused:
+            if not self._paused or not self._recording_active:
                 return
             self._start_new_segment()
             self._paused = False
@@ -8606,6 +8938,7 @@ class _VideoRecorder:
     def stop(self):
         with self._ctrl_lock:
             self._stop_current_segment()
+            self._recording_active = False
         _clear_active_video_recorder_if(self)
 
     def _cleanup_temp_files(self, keep_paths=None):
@@ -8621,6 +8954,50 @@ class _VideoRecorder:
                     os.remove(p)
             except OSError:
                 pass
+
+    def _probe_audio_levels(self, audio_path):
+        if not audio_path or not os.path.exists(audio_path):
+            return None
+        try:
+            proc = subprocess.run(
+                [self._ffmpeg, "-hide_banner", "-i", audio_path,
+                 "-af", "volumedetect", "-f", "null", "-"],
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+                encoding="utf-8",
+                errors="replace",
+                **_SUBPROCESS_FLAGS,
+            )
+        except Exception:
+            return None
+
+        output = proc.stderr or ""
+        mean_volume = None
+        max_volume = None
+        for line in output.splitlines():
+            line = line.strip()
+            if "mean_volume:" in line:
+                try:
+                    mean_volume = float(line.split("mean_volume:", 1)[1].split(" dB", 1)[0].strip())
+                except Exception:
+                    pass
+            elif "max_volume:" in line:
+                try:
+                    max_volume = float(line.split("max_volume:", 1)[1].split(" dB", 1)[0].strip())
+                except Exception:
+                    pass
+        return {"mean_volume": mean_volume, "max_volume": max_volume}
+
+    def _audio_is_effectively_silent(self, audio_path):
+        probe = self._probe_audio_levels(audio_path)
+        if not probe:
+            return False
+        mean_volume = probe.get("mean_volume")
+        max_volume = probe.get("max_volume")
+        if mean_volume is None or max_volume is None:
+            return False
+        return mean_volume <= -45.0 and max_volume <= -25.0
 
     def finalize(self, audio_path=None, extra_audio_path=None):
         self.stop()
@@ -8691,24 +9068,43 @@ class _VideoRecorder:
         _mic_audio = extra_audio_path if (extra_audio_path and os.path.exists(extra_audio_path)
                                           and os.path.getsize(extra_audio_path) > 0) else None
 
+        if _sys_audio and self._audio_is_effectively_silent(_sys_audio):
+            print(f"  [DEBUG] 系統音訊近乎全靜音，略過混音: {_sys_audio}", flush=True)
+            _sys_audio = None
+        if _mic_audio and self._audio_is_effectively_silent(_mic_audio):
+            print(f"  [DEBUG] 麥克風音訊近乎全靜音，略過混音: {_mic_audio}", flush=True)
+            _mic_audio = None
+
         if _sys_audio and _mic_audio:
             _a1_mb = os.path.getsize(_sys_audio) / (1024 * 1024)
             _a2_mb = os.path.getsize(_mic_audio) / (1024 * 1024)
             print(f"  [DEBUG] 使用音訊路徑（系統+麥克風混合）: {_sys_audio} ({_a1_mb:.2f} MB) + {_mic_audio} ({_a2_mb:.2f} MB)", flush=True)
             cmd += ["-i", _sys_audio, "-i", _mic_audio,
-                    "-filter_complex", "[1:a][2:a]amix=inputs=2:duration=longest:weights='1 1':normalize=1[aout]",
-                    "-map", "0:v", "-map", "[aout]",
-                    "-c:v", "copy", "-c:a", "aac", "-b:a", "192k", "-shortest", self.path]
+                "-filter_complex",
+                "[0:v]setpts=PTS-STARTPTS[vout];"
+                "[1:a][2:a]amix=inputs=2:duration=longest:weights='1 1':normalize=1,asetpts=PTS-STARTPTS[aout]",
+                "-map", "[vout]", "-map", "[aout]",
+                "-c:v", "libx264", "-preset", "veryfast", "-crf", "23",
+                "-pix_fmt", "yuv420p", "-r", str(self._framerate),
+                "-c:a", "aac", "-b:a", "192k", "-shortest", self.path]
         elif _sys_audio:
             print(f"  [DEBUG] 使用音訊路徑（系統音訊）: {_sys_audio}", flush=True)
             if extra_audio_path and not _mic_audio:
                 print(f"  [DEBUG] 麥克風音訊無效，略過混音: {extra_audio_path}", flush=True)
-            cmd += ["-i", _sys_audio, "-map", "0:v", "-map", "1:a?",
-                    "-c:v", "copy", "-c:a", "aac", "-b:a", "192k", "-shortest", self.path]
+            cmd += ["-i", _sys_audio,
+                "-filter_complex", "[0:v]setpts=PTS-STARTPTS[vout];[1:a]asetpts=PTS-STARTPTS[aout]",
+                "-map", "[vout]", "-map", "[aout]",
+                "-c:v", "libx264", "-preset", "veryfast", "-crf", "23",
+                "-pix_fmt", "yuv420p", "-r", str(self._framerate),
+                "-c:a", "aac", "-b:a", "192k", "-shortest", self.path]
         elif _mic_audio:
             print(f"  [DEBUG] 系統音訊無效，改用麥克風音訊: {_mic_audio}", flush=True)
-            cmd += ["-i", _mic_audio, "-map", "0:v", "-map", "1:a?",
-                    "-c:v", "copy", "-c:a", "aac", "-b:a", "192k", "-shortest", self.path]
+            cmd += ["-i", _mic_audio,
+                "-filter_complex", "[0:v]setpts=PTS-STARTPTS[vout];[1:a]asetpts=PTS-STARTPTS[aout]",
+                "-map", "[vout]", "-map", "[aout]",
+                "-c:v", "libx264", "-preset", "veryfast", "-crf", "23",
+                "-pix_fmt", "yuv420p", "-r", str(self._framerate),
+                "-c:a", "aac", "-b:a", "192k", "-shortest", self.path]
         else:
             print(f"  [DEBUG] 無音訊，純視訊輸出", flush=True)
             cmd += ["-c", "copy", self.path]
@@ -9471,7 +9867,7 @@ class _DualStreamMixer:
             self._mic_buf = self._np.zeros(0, dtype=self._np.float32)
 
 
-def _setup_mixed_recording(stop_event, meeting_topic):
+def _setup_mixed_recording(stop_event, meeting_topic, start_event=None, start_time_ref=None):
     """建立 Windows 混合錄音（WASAPI Loopback + 麥克風）。
     回傳 (recorder, mixer, lb_stream, mic_stream) 或 None（失敗時）。"""
     import sounddevice as sd
@@ -9489,7 +9885,9 @@ def _setup_mixed_recording(stop_event, meeting_topic):
 
     # 統一用 Loopback 取樣率作為錄音取樣率
     rec_sr = lb_sr
-    recorder = _AudioRecorder(rec_sr, 1, topic=meeting_topic)
+    recorder = _AudioRecorder(rec_sr, 1, topic=meeting_topic,
+                              start_event=start_event,
+                              start_time_ref=start_time_ref)
     mixer = _DualStreamMixer(recorder, rec_sr)
 
     def lb_callback(indata, frames, time_info, status):
@@ -10591,19 +10989,25 @@ def _append_realtime_segment(segments_data, lines, end_sec, duration_hint=0.0,
         return
 
     total_text_len = sum(len(item["text"]) for item in cleaned_lines)
-    duration = max(float(duration_hint or 0.0), 1.2)
-    duration = max(duration, min(max(total_text_len / 8.0, 1.2), 8.0))
+    display_duration = min(max(total_text_len / 8.0, 1.2), 8.0)
+    # 即時字幕的 end_sec 是「模型輸出這段文字的時間」，不是語音真正開始的時間。
+    # 先前用文字長度大幅回推 start_sec，會讓字幕比實際聲音早好幾秒出現。
+    # 改為只允許很小的回填（以實際處理耗時為上限），並把可讀取時長保留在後段。
+    backfill = min(max(float(duration_hint or 0.0), 0.0), 0.8)
     end_sec = max(float(end_sec or 0.0), 0.0)
     if end_sec <= 0:
-        end_sec = duration
-    start_sec = max(0.0, end_sec - duration)
+        start_sec = 0.0
+        end_sec = display_duration
+    else:
+        start_sec = max(0.0, end_sec - backfill)
+        end_sec = max(end_sec, start_sec + display_duration)
 
     if segments_data:
         prev_end = max(float(segments_data[-1].get("end", 0.0) or 0.0), 0.0)
         if start_sec < prev_end:
             start_sec = prev_end
         if end_sec <= start_sec:
-            end_sec = start_sec + max(0.8, min(duration, 4.0))
+            end_sec = start_sec + max(0.8, min(display_duration, 4.0))
 
     segment = {
         "start": round(start_sec, 3),
